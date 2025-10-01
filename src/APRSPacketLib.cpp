@@ -28,8 +28,46 @@ _______________________________________________*/
 
 
 #include <APRSPacketLib.h>
+#include <cmath>
 
 namespace APRSPacketLib {
+
+    /**
+     * @brief Applies ambiguity to a GPS coordinate by reducing its precision.
+     *
+     * This function implements the standard APRS position ambiguity by truncating
+     * the decimal part of the coordinate's minutes. The new, less-precise
+     * coordinate is then used for encoding.
+     *
+     * @param coordinate The original coordinate in decimal degrees.
+     * @param ambiguity_level An integer from 0 to 4.
+     *        - 0: No ambiguity.
+     *        - 1: Reduces precision to 0.1 minutes (e.g., 4903.5_N).
+     *        - 2: Reduces precision to 1 minute (e.g., 4903.__N).
+     *        - 3: Reduces precision to 10 minutes (e.g., 490_.__N).
+     *        - 4: Reduces precision to 1 degree (e.g., 49__.__N).
+     * @return The coordinate with reduced precision.
+     */
+    float apply_ambiguity(float coordinate, int ambiguity_level) {
+        if (ambiguity_level <= 0) {
+            return coordinate;
+        }
+
+        float deg = floorf(fabsf(coordinate));
+        float dec_minutes = (fabsf(coordinate) - deg) * 60.0f;
+
+        switch (ambiguity_level) {
+            case 1: dec_minutes = floorf(dec_minutes * 10.0f) / 10.0f; break;
+            case 2: dec_minutes = floorf(dec_minutes); break;
+            case 3: dec_minutes = floorf(dec_minutes / 10.0f) * 10.0f; break;
+            default: dec_minutes = 0.0f; break; // Level 4 and higher
+        }
+
+        float new_coordinate = deg + dec_minutes / 60.0f;
+
+        // TODO, if in Base91 encoding, add on half of the precision lost to center the position
+        return copysignf(new_coordinate, coordinate);
+    }
 
     String generateBasePacket(const String& callsign, const String& tocall, const String& path) {
         String packet = callsign;
@@ -91,7 +129,14 @@ namespace APRSPacketLib {
         return(s);
     }
 
-    String encodeGPSIntoBase91(float latitude, float longitude, float course, float speed, const String& symbol, bool sendAltitude, int altitude, bool sendStandingUpdate) {
+    String encodeGPSIntoBase91(float latitude, float longitude, float course, float speed, const String& symbol, bool sendAltitude, int altitude, bool sendStandingUpdate, int ambiguity_level) {
+        // Apply ambiguity to the coordinates if requested.
+        // This truncates the precision before encoding.
+        if (ambiguity_level > 0) {
+            latitude = apply_ambiguity(latitude, ambiguity_level);
+            longitude = apply_ambiguity(longitude, ambiguity_level);
+        }
+
         String encodedData;
         uint32_t aprs_lat, aprs_lon;
         aprs_lat = 900000000 - latitude * 10000000;
@@ -386,7 +431,7 @@ namespace APRSPacketLib {
         buf[2] = h28;
     }
 
-    void encodeMiceDestinationField(const String& msgType, uint8_t *buf, const gpsLatitudeStruct *lat, const gpsLongitudeStruct *lon) {
+    void encodeMiceDestinationField(const String& msgType, uint8_t *buf, const gpsLatitudeStruct *lat, const gpsLongitudeStruct *lon, int ambiguity_level) {
         uint32_t temp;
         temp = lat->degrees / 10;             // degrees
         buf[0] = (temp + 0x30);
@@ -402,6 +447,19 @@ namespace APRSPacketLib {
         temp   = lat->minuteHundredths/10;  // minute hundredths
         buf[4] = (temp + 0x30) + ((lon->degrees >= 100 || lon->degrees <= 9) ? 0x20 : 0);   // Longitude Offset
         buf[5] = (lat->minuteHundredths - temp * 10 + 0x30) + (!lon->east ? 0x20 : 0);      // West validation
+
+        if (ambiguity_level >= 1) {
+            buf[5] = (lon->east) ? 'L' : 'Z';
+        }
+        if (ambiguity_level >= 2) {
+            buf[4] = (lon->degrees >= 100 || lon->degrees <= 9) ? 'Z' : 'L';
+        }
+        if (ambiguity_level >= 3) {
+            buf[3] = (lat->north) ? 'Z' : 'L';
+        }
+        if (ambiguity_level >= 4) {
+            buf[2] = (msgType[2] == '1') ? 'Z' : 'L';
+        }
     }
 
     String doubleToString(double n, int ndec) {
@@ -494,12 +552,18 @@ namespace APRSPacketLib {
         return miceLongitudeStruct;
     }
 
-    String generateMiceGPSBeaconPacket(const String& miceMsgType, const String& callsign, const String& symbol, const String& overlay, const String& path, float latitude, float longitude, float course, float speed, int altitude) {
+    String generateMiceGPSBeaconPacket(const String& miceMsgType, const String& callsign, const String& symbol, const String& overlay, const String& path, float latitude, float longitude, float course, float speed, int altitude, int ambiguity_level) {
+        // Apply ambiguity to the coordinates if requested. This truncates the precision.
+        if (ambiguity_level > 0) {
+            latitude = apply_ambiguity(latitude, ambiguity_level);
+            longitude = apply_ambiguity(longitude, ambiguity_level);
+        }
+
         gpsLatitudeStruct latitudeStruct    = gpsDecimalToDegreesMiceLatitude(latitude);
         gpsLongitudeStruct longitudeStruct  = gpsDecimalToDegreesMiceLongitude(longitude);
 
         uint8_t miceDestinationArray[7];
-        encodeMiceDestinationField(miceMsgType, &miceDestinationArray[0], &latitudeStruct, &longitudeStruct);
+        encodeMiceDestinationField(miceMsgType, &miceDestinationArray[0], &latitudeStruct, &longitudeStruct, ambiguity_level);
         miceDestinationArray[6] = 0x00;     // por repetidor?
         String miceDestination = (char*)miceDestinationArray;
 
