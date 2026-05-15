@@ -1,0 +1,10 @@
+name = "Validated_Test_Vectors"
+version = "0.1.0"
+defaultTargets = ["validated_test_vectors"]
+
+[[lean_lib]]
+name = "ValidatedTestVectors"
+
+[[lean_exe]]
+name = "validated_test_vectors"
+root = "Main"
