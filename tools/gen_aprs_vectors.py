@@ -43,10 +43,27 @@ Subcommands
                        invocation documented in
                        tools/ValidatedTestVectors/CLAUDE.md.
 
-    validate-direwolf  Stub. Direwolf encode + decode validation is on
-                       the roadmap; this subcommand exists so the CLI
-                       surface is stable. Returns 0 with an explanatory
-                       message.
+    validate-direwolf  Decode + encode cross-check through Direwolf.
+                       Decode pass: each course×speed pair and each
+                       fixed point (twice -- cs slot carrying
+                       course/speed, then altitude) is piped through
+                       `decode_aprs(1)` and the parsed lat/lon,
+                       course, speed and altitude are compared to the
+                       JSON values at the tightest spec-justified
+                       tolerance. Encode pass: each fixed point is
+                       fed to `direwolf` via PBEACON COMPRESS=1,
+                       the emitted base91 lat/lon bytes are captured
+                       from the monitor log and decoded back via the
+                       spec formula; the decoded value must lie
+                       within one encoder ULP of the input (byte
+                       agreement isn't required because direwolf
+                       rounds to nearest where the spec example and
+                       our encoder floor). Requires `decode_aprs` and
+                       `direwolf` on PATH and an audio device with at
+                       least one input channel (`brew install
+                       direwolf` on macOS, plus a virtual loopback
+                       like BlackHole 2ch if no real input device is
+                       present).
 
 Bit-stable regeneration
 -----------------------
@@ -61,8 +78,9 @@ Validation tolerances
 
 Tolerances are picked at the tightest spec-/arithmetic-justified value
 and the rationale lives next to each constant. See `_LAT_TOL_DEG`,
-`_LON_TOL_DEG`, `_SPEED_TOL_KMH` in `_validate_aprslib`, and the
-matching constants in `Main.lean`.
+`_LON_TOL_DEG`, `_SPEED_TOL_KMH` in `cmd_validate_aprslib` /
+`cmd_validate_direwolf`, the altitude `_alt_tol_m` in
+`cmd_validate_direwolf`, and the matching constants in `Main.lean`.
 """
 
 from __future__ import annotations
@@ -70,6 +88,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
+import shutil
 import subprocess
 import sys
 import warnings
@@ -139,6 +159,15 @@ def base91_pack(value: int, width: int) -> str:
         digit = (value // (91 ** i)) % 91
         out.append(chr(digit + 33))
     return "".join(out)
+
+
+def base91_unpack(s: str) -> int:
+    """Inverse of `base91_pack`. Each byte must lie in '!'..'{' (ASCII
+    33..123); behaviour outside that range is unspecified."""
+    n = 0
+    for ch in s:
+        n = n * 91 + (ord(ch) - 33)
+    return n
 
 
 def encode_lat_base91(lat_deg: float) -> str:
@@ -582,15 +611,395 @@ def cmd_validate_lean(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# validate-direwolf: stub
+# validate-direwolf: decode + encode cross-checks through Direwolf
 # ---------------------------------------------------------------------------
 
+# decode_aprs colours its output with ANSI escapes; strip them so the
+# regexes below see plain text.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+# `N|S DD MM.mmmm, E|W DDD MM.mmmm` — the position line direwolf emits
+# for every successfully parsed compressed-position frame.
+_LATLON_RE = re.compile(
+    r"([NS])\s+(\d+)\s+(\d+\.\d+),\s+([EW])\s+(\d+)\s+(\d+\.\d+)"
+)
+# `<kmh> km/h (<mph> MPH), course <deg>` — only present when the T-byte
+# selects course/speed and the cs slot is not the no-data sentinel.
+_CS_RE = re.compile(r"(\d+)\s+km/h\s+\(\d+\s+MPH\),\s+course\s+(\d+)")
+# `alt <m> m (<ft> ft)` — only present when the T-byte selects altitude.
+_ALT_RE = re.compile(r"alt\s+(-?\d+)\s+m")
+
+# Locations decode_aprs probes for tocalls.yaml, plus the Homebrew path
+# it does *not* probe but which is the canonical macOS install dir. If
+# any candidate has tocalls.yaml we cd there so the relative-path lookup
+# inside decode_aprs succeeds and the noisy warning disappears from
+# stdout.
+_DIREWOLF_DATA_CANDIDATES = (
+    Path("/usr/local/share/direwolf"),
+    Path("/usr/share/direwolf"),
+    Path("/opt/local/share/direwolf"),
+    Path("/opt/homebrew/share/direwolf"),
+)
+
+
+def _find_direwolf_data_dir() -> Path | None:
+    for cand in _DIREWOLF_DATA_CANDIDATES:
+        if (cand / "tocalls.yaml").is_file():
+            return cand
+    return None
+
+
+def _decode_via_direwolf(packet: str, exe: str, cwd: Path | None) -> dict:
+    """Run `decode_aprs` on one monitor-format packet and return the
+    parsed fields. Keys (subset of): `latitude`, `longitude`, `course`,
+    `speed_kmh`, `altitude_m`, plus `_raw` (ANSI-stripped stdout) for
+    failure diagnostics."""
+    proc = subprocess.run(
+        [exe],
+        input=packet + "\n",
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(cwd) if cwd else None,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"decode_aprs exited {proc.returncode}: {proc.stderr.strip()!r}"
+        )
+    clean = _ANSI_RE.sub("", proc.stdout)
+    parsed: dict = {"_raw": clean}
+    m = _LATLON_RE.search(clean)
+    if m:
+        ns, lat_d, lat_m, ew, lon_d, lon_m = m.groups()
+        lat = int(lat_d) + float(lat_m) / 60.0
+        if ns == "S":
+            lat = -lat
+        lon = int(lon_d) + float(lon_m) / 60.0
+        if ew == "W":
+            lon = -lon
+        parsed["latitude"]  = lat
+        parsed["longitude"] = lon
+    m = _CS_RE.search(clean)
+    if m:
+        parsed["speed_kmh"] = int(m.group(1))
+        parsed["course"]    = int(m.group(2))
+    m = _ALT_RE.search(clean)
+    if m:
+        parsed["altitude_m"] = int(m.group(1))
+    return parsed
+
+
+# ---- encode side: drive `direwolf` to emit PBEACONs and capture the bytes ----
+
+# Beacon monitor line: `[<chan>] <SRC>>... :!/<lat4><lon4><sym>...`.
+# Direwolf prints these regardless of audio outcome -- we never decode
+# the modulated audio, we just scrape the textual log.
+_BEACON_LINE_RE = re.compile(
+    r"^\[\s*[0-9.]+\s*\]\s+(?P<src>[A-Z0-9-]+)>[^:]+:!/(?P<lat>.{4})(?P<lon>.{4})"
+)
+# Audio-device dump produced by direwolf at startup; we use it to pick a
+# device when the user hasn't named one and direwolf's default lookup
+# fails (common on macOS). Each block looks like:
+#
+#     Name        = "BlackHole 2ch"
+#     Host API    = Core Audio
+#     Max inputs  = 2
+#     Max outputs = 2
+_DEVICE_BLOCK_RE = re.compile(
+    r'Name\s*=\s*"(?P<name>[^"]+)"\s*\n'
+    r'[^\n]*\n'
+    r'\s*Max inputs\s*=\s*(?P<inputs>\d+)'
+)
+
+
+def _direwolf_run(conf: str, exe: str, cwd: Path | None, timeout: float) -> str:
+    """Run direwolf with `conf` as the configuration file contents. We
+    write a tempfile because direwolf reads its config via fopen, not
+    stdin -- the `-c -` form is not supported. Returns the combined
+    stdout/stderr with ANSI colour codes stripped."""
+    import tempfile
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".conf", delete=False
+    ) as f:
+        f.write(conf)
+        conf_path = f.name
+    try:
+        try:
+            proc = subprocess.run(
+                [exe, "-c", conf_path, "-t", "0", "-q", "hd"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+                cwd=str(cwd) if cwd else None,
+            )
+            out = proc.stdout + proc.stderr
+        except subprocess.TimeoutExpired as exc:
+            out = (exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")) \
+                + (exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or ""))
+    finally:
+        Path(conf_path).unlink(missing_ok=True)
+    return _ANSI_RE.sub("", out)
+
+
+def _direwolf_pick_audio_device(exe: str, cwd: Path | None) -> str | None:
+    """Run direwolf with a stub config that has no ADEVICE; parse the
+    enumerated device list it prints during startup, and pick the first
+    device with at least one input channel. Returns the device name to
+    pass via ADEVICE, or None if no suitable device exists."""
+    stub = "ACHANNELS 1\nCHANNEL 0\nMYCALL TEST\nMODEM 1200\n"
+    out = _direwolf_run(stub, exe, cwd, timeout=8.0)
+    for m in _DEVICE_BLOCK_RE.finditer(out):
+        if int(m.group("inputs")) > 0:
+            return m.group("name")
+    return None
+
+
+def _encode_via_direwolf(
+    points: list[dict],
+    exe: str,
+    audio_device: str,
+    cwd: Path | None,
+) -> dict[str, tuple[str, str]]:
+    """Run direwolf with one staggered PBEACON per point and return
+    {source_callsign: (base91_lat, base91_lon)}. Each point's beacon
+    uses SENDTO=R0 (simulated reception) so direwolf never has to
+    actually modulate audio -- the monitor line still prints."""
+    lines = [
+        f'ADEVICE "{audio_device}" "{audio_device}"',
+        "ACHANNELS 1",
+        "CHANNEL 0",
+        "MYCALL TEST",
+        "MODEM 1200",
+    ]
+    sources: list[str] = []
+    for i, p in enumerate(points):
+        src = f"TEST{i + 1}"
+        sources.append(src)
+        # DELAY=0:0N means N seconds; stagger so beacons don't collide.
+        lines.append(
+            f"PBEACON DELAY=0:0{i + 1} EVERY=10:00 SENDTO=R0 "
+            f"SOURCE={src} LAT={p['lat_deg']:.6f} LONG={p['lon_deg']:.6f} "
+            f"SYMBOL=/> COMPRESS=1"
+        )
+    conf = "\n".join(lines) + "\n"
+
+    # Allow ~3s startup + 1s per beacon + a small safety margin.
+    out = _direwolf_run(conf, exe, cwd, timeout=5.0 + len(points))
+
+    captured: dict[str, tuple[str, str]] = {}
+    for line in out.splitlines():
+        m = _BEACON_LINE_RE.match(line)
+        if m and m.group("src") in sources:
+            captured[m.group("src")] = (m.group("lat"), m.group("lon"))
+    return captured
+
+
 def cmd_validate_direwolf(args: argparse.Namespace) -> int:
-    # Roadmap: invoke `kissutil` (or `decode_aprs`) to round-trip each
-    # fixed point through Direwolf's encoder and decoder, then compare.
-    # Tolerance plan: byte-exact for encode, ULP-tight for decode (same
-    # rationale as validate-aprslib).
-    print("direwolf validation not yet implemented")
+    exe = shutil.which("decode_aprs")
+    if not exe:
+        print(
+            "ERROR: `decode_aprs` not found on PATH. Install Direwolf:\n"
+            "  brew install direwolf      # macOS\n"
+            "  apt-get install direwolf   # Debian/Ubuntu",
+            file=sys.stderr,
+        )
+        return 2
+
+    data       = json.loads(args.json.read_text())
+    lat_factor = data["_lat_factor"]
+    lon_factor = data["_lon_factor"]
+    t_byte_cs  = data["_t_byte_cs"]
+    t_byte_alt = data["_t_byte_alt"]
+    cwd        = _find_direwolf_data_dir()
+
+    # Tolerance rationale (kept here, not at module top, so it sits
+    # next to the comparison it governs):
+    #
+    # _LAT_TOL_DEG / _LON_TOL_DEG: the encoder floors to 1/factor deg
+    # (one ULP, ~2.6e-6 lat / ~5.3e-6 lon). decode_aprs prints
+    # `DD MM.mmmm`, so the readback adds half-of-last-digit ≈
+    # 0.5 * 1e-4 / 60 ≈ 8.3e-7 deg. Use the ULP bound plus a 1e-6
+    # slack covering the print truncation plus float noise.
+    #
+    # _SPEED_TOL_KMH: direwolf prints km/h as a rounded integer (the
+    # C library truncates; see decode_speed_kmh docstring). Comparing
+    # the direwolf integer against the closed-form spec float must
+    # therefore tolerate the half-LSB rounding gap. ±1 km/h is the
+    # bound; anything tighter would fail on every speed whose km/h
+    # value is within 0.5 of an integer (e.g. 'T' at 91.90 km/h:
+    # truncates to 91, rounds to 92).
+    #
+    # _alt_tol_m(m): encoder is `int(log_1.002(ft))` -- one ULP in
+    # log space means ft is recovered within a multiplicative factor
+    # of 1.002, i.e. up to `m * 0.002` metres lost. direwolf rounds
+    # the metre value when printing, adding another ±1 m. Combined
+    # bound: `ceil(m * 0.002) + 1` metres. Scales naturally with
+    # altitude -- the NorthPole 5000 m case sits at ±11 m, sea-level
+    # cases at ±1 m.
+    _LAT_TOL_DEG   = 1.0 / lat_factor + 1e-6
+    _LON_TOL_DEG   = 1.0 / lon_factor + 1e-6
+    _SPEED_TOL_KMH = 1
+    def _alt_tol_m(m: int) -> int:
+        return math.ceil(m * 0.002) + 1
+
+    failures: list[str] = []
+
+    # Course/speed slot: cartesian product so each c-byte pairs with
+    # every s-byte (parallels validate-aprslib's coverage).
+    for cv in data["course_vectors"]:
+        for sv in data["speed_vectors"]:
+            c_byte = cv["encoded"]
+            s_byte = sv["encoded"]
+            packet = f"TEST>APRS:=/<<<<<<<<>{c_byte}{s_byte}{t_byte_cs}"
+            try:
+                got = _decode_via_direwolf(packet, exe, cwd)
+            except RuntimeError as exc:
+                failures.append(f"{packet!r}: {exc}")
+                continue
+
+            # decode_aprs prints encoded-course 0 as 0 (not 360, the
+            # v1.2-spec mapping aprslib uses). Compare against the raw
+            # JSON value.
+            got_course = got.get("course")
+            if got_course != cv["course_deg"]:
+                failures.append(
+                    f"course byte {c_byte!r}: expected {cv['course_deg']}°, "
+                    f"direwolf got {got_course}°"
+                )
+
+            # Compare against the spec float; the JSON's
+            # `speed_kmh_decoded` is the *truncating* C-library value
+            # and disagrees with direwolf's rounded print by ~1 km/h
+            # whenever the float lies within 0.5 of an integer.
+            spec_kmh = decode_speed_kn(s_byte) * 1.852
+            got_kmh = got.get("speed_kmh")
+            if got_kmh is None or abs(got_kmh - spec_kmh) > _SPEED_TOL_KMH:
+                failures.append(
+                    f"speed byte {s_byte!r}: spec {spec_kmh:.3f} km/h, "
+                    f"direwolf got {got_kmh} km/h "
+                    f"(tolerance ±{_SPEED_TOL_KMH} km/h)"
+                )
+
+    # Fixed points: lat/lon from the recorded base-91 bytes (cs slot
+    # carries course/speed for one packet, altitude for the other so
+    # we exercise both T-byte branches).
+    for p in data["fixed_points"]:
+        packet_cs = (
+            "TEST>APRS:=/"
+            f"{p['base91_lat']}{p['base91_lon']}>"
+            f"{p['base91_c']}{p['base91_s']}{t_byte_cs}"
+        )
+        try:
+            got = _decode_via_direwolf(packet_cs, exe, cwd)
+        except RuntimeError as exc:
+            failures.append(f"{p['name']}: {exc}")
+            continue
+
+        for field, expected, tol in (
+            ("latitude",  p["lat_deg"], _LAT_TOL_DEG),
+            ("longitude", p["lon_deg"], _LON_TOL_DEG),
+        ):
+            v = got.get(field)
+            if v is None or abs(v - expected) > tol:
+                residual = None if v is None else v - expected
+                failures.append(
+                    f"{p['name']}: {field} expected {expected}, "
+                    f"direwolf got {v} (residual {residual!r}, "
+                    f"tolerance {tol:.3e} deg)"
+                )
+
+        packet_alt = (
+            "TEST>APRS:=/"
+            f"{p['base91_lat']}{p['base91_lon']}>"
+            f"{p['base91_alt_c']}{p['base91_alt_s']}{t_byte_alt}"
+        )
+        try:
+            got = _decode_via_direwolf(packet_alt, exe, cwd)
+        except RuntimeError as exc:
+            failures.append(f"{p['name']} (alt): {exc}")
+            continue
+
+        v = got.get("altitude_m")
+        alt_tol = _alt_tol_m(p["altitude_m"])
+        if v is None or abs(v - p["altitude_m"]) > alt_tol:
+            failures.append(
+                f"{p['name']}: altitude_m expected {p['altitude_m']}, "
+                f"direwolf got {v} (tolerance ±{alt_tol} m)"
+            )
+
+    # ---- encode pass: drive direwolf's compressed-position encoder ----
+    #
+    # Coverage is narrower than the decode side: direwolf's PBEACON
+    # command is for stationary stations, so it never emits base91
+    # course/speed bytes (the cs slot is the two-space "no-data"
+    # sentinel) and writes altitude as the comment-style
+    # `/A=NNNNNN` block rather than packing it into cs with T='Q'.
+    # That leaves lat/lon as the only base91 fields direwolf produces,
+    # so this pass round-trips those alone.
+    #
+    # Tolerance: 1/factor + 1e-12. The encode side cannot assume
+    # byte-exact agreement -- the spec example on p38 floors
+    # (`190463 * 107.25 = 20427156`), our encoder floors, but
+    # direwolf's encoder rounds to nearest. Both are spec-compliant;
+    # either way the decoded value is within one ULP of the input.
+    encode_direwolf = shutil.which("direwolf")
+    if encode_direwolf:
+        audio_device = _direwolf_pick_audio_device(encode_direwolf, cwd)
+        if not audio_device:
+            failures.append(
+                "encode: no audio-input device found via direwolf; "
+                "the encode oracle requires one device with Max inputs > 0 "
+                "(install BlackHole 2ch on macOS, or any ALSA capture device on Linux)"
+            )
+        else:
+            captured = _encode_via_direwolf(
+                data["fixed_points"], encode_direwolf, audio_device, cwd
+            )
+            _ENCODE_TOL_LAT_DEG = 1.0 / lat_factor + 1e-12
+            _ENCODE_TOL_LON_DEG = 1.0 / lon_factor + 1e-12
+            for i, p in enumerate(data["fixed_points"]):
+                src = f"TEST{i + 1}"
+                bytes_pair = captured.get(src)
+                if bytes_pair is None:
+                    failures.append(
+                        f"encode {p['name']}: no PBEACON line captured from direwolf"
+                    )
+                    continue
+                lat_bytes, lon_bytes = bytes_pair
+                dw_lat = 90.0  - base91_unpack(lat_bytes) / lat_factor
+                dw_lon = base91_unpack(lon_bytes) / lon_factor - 180.0
+                for field, exp, got, tol in (
+                    ("lat", p["lat_deg"], dw_lat, _ENCODE_TOL_LAT_DEG),
+                    ("lon", p["lon_deg"], dw_lon, _ENCODE_TOL_LON_DEG),
+                ):
+                    if abs(got - exp) > tol:
+                        failures.append(
+                            f"encode {p['name']}: {field} input {exp}, "
+                            f"direwolf encoded {lat_bytes if field=='lat' else lon_bytes!r} "
+                            f"-> {got} (residual {got - exp:.3e}, "
+                            f"tolerance {tol:.3e} deg)"
+                        )
+    else:
+        # decode_aprs is present (checked above) but the daemon binary
+        # is missing -- unusual; just record and continue.
+        failures.append(
+            "encode: `direwolf` binary not on PATH; "
+            "encode pass skipped (decode pass still ran)"
+        )
+
+    if failures:
+        print("FAIL: direwolf disagrees with JSON-recorded vectors:", file=sys.stderr)
+        for f in failures:
+            print(f"  - {f}", file=sys.stderr)
+        return 1
+    print(
+        f"OK: {len(data['course_vectors'])} course × "
+        f"{len(data['speed_vectors'])} speed pairs and "
+        f"{len(data['fixed_points'])} fixed points (×2 cs/alt) decode, "
+        f"plus {len(data['fixed_points'])} encode round-trips, "
+        f"all match direwolf within spec tolerance"
+    )
     return 0
 
 
@@ -627,7 +1036,7 @@ def _build_parser() -> argparse.ArgumentParser:
     l.set_defaults(func=cmd_validate_lean)
 
     d = sub.add_parser("validate-direwolf",
-                       help="(stub) encode + decode through Direwolf")
+                       help="decode + encode cross-check through Direwolf")
     d.add_argument("--json", type=Path, default=DEFAULT_JSON)
     d.set_defaults(func=cmd_validate_direwolf)
 

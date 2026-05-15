@@ -29,7 +29,7 @@ test/common/aprs_vectors.h                        (committed)
 | `header`             | `aprs_vectors.json`  | `test/common/aprs_vectors.h`    | —                                                 |
 | `validate-aprslib`   | `aprs_vectors.json`  | —                               | aprslib parse → recovered fields (decode only)    |
 | `validate-lean`      | `aprs_vectors.json`  | —                               | Lean `encodeLat`/`decodeLat` etc. (encode+decode) |
-| `validate-direwolf`  | `aprs_vectors.json`  | —                               | (stub; planned)                                   |
+| `validate-direwolf`  | `aprs_vectors.json`  | —                               | `decode_aprs(1)` decode + `direwolf` PBEACON encode |
 
 ```sh
 tools/.venv/bin/python tools/gen_aprs_vectors.py generate
@@ -68,6 +68,13 @@ are reviewable.
 | `validate-lean`     | `encodeLat`/`encodeLon`| **byte-exact** (zero)                             | `validateRow`    in `Main.lean`                         |
 | `validate-lean`     | `decodeLat` (deg)      | `1 / latFactor` (proven `floor_error_lt_one`)     | `latTol`         in `Main.lean`                         |
 | `validate-lean`     | `decodeLon` (deg)      | `1 / lonFactor` (proven `floor_error_lt_one`)     | `lonTol`         in `Main.lean`                         |
+| `validate-direwolf` | `latitude`  (deg)      | `1/380926 + 1e-6` (ULP + DDMM.mmmm print)         | `_LAT_TOL_DEG`   in `cmd_validate_direwolf`             |
+| `validate-direwolf` | `longitude` (deg)      | `1/190463 + 1e-6` (ULP + DDMM.mmmm print)         | `_LON_TOL_DEG`   in `cmd_validate_direwolf`             |
+| `validate-direwolf` | `course` (deg)         | exact int (no v1.2 0↔360 normalisation)           | inline check     in `cmd_validate_direwolf`             |
+| `validate-direwolf` | `speed` (km/h)         | `±1` vs spec float (direwolf rounds; lib trunc.)  | `_SPEED_TOL_KMH` in `cmd_validate_direwolf`             |
+| `validate-direwolf` | `altitude_m`           | `ceil(m * 0.002) + 1` m (log_1.002 ULP + print)   | `_alt_tol_m`     in `cmd_validate_direwolf`             |
+| `validate-direwolf` | `encode lat → decode`  | `1/380926 + 1e-12` deg (one encoder ULP)          | `_ENCODE_TOL_LAT_DEG` in `cmd_validate_direwolf`        |
+| `validate-direwolf` | `encode lon → decode`  | `1/190463 + 1e-12` deg (one encoder ULP)          | `_ENCODE_TOL_LON_DEG` in `cmd_validate_direwolf`        |
 
 The Lean tolerances are tighter than `latEpsilon = 1/300000` /
 `lonEpsilon = 1/150000` in `ValidatedTestVectors/Basic.lean`. Those
