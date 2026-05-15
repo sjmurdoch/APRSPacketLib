@@ -50,18 +50,18 @@ def jsonEscape (s : String) : String :=
     | '\\' => acc ++ "\\\\"
     | c    => acc.push c) ""
 
-def quote (s : String) : String :=
+def jsonQuote (s : String) : String :=
   "\"" ++ jsonEscape s ++ "\""
 
 def renderPoint (p : FixedPoint) : String :=
   let encLat := encodeLat p.lat
   let encLon := encodeLon p.lon
   "    {" ++
-    "\"name\": "       ++ quote p.name ++
+    "\"name\": "       ++ jsonQuote p.name ++
     ", \"lat_deg\": "  ++ p.latStr ++
     ", \"lon_deg\": "  ++ p.lonStr ++
-    ", \"base91_lat\": " ++ quote encLat ++
-    ", \"base91_lon\": " ++ quote encLon ++
+    ", \"base91_lat\": " ++ jsonQuote encLat ++
+    ", \"base91_lon\": " ++ jsonQuote encLon ++
   "}"
 
 def renderJson : String :=

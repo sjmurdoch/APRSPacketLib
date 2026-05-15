@@ -65,7 +65,7 @@ Two headline theorems in `Basic.lean`:
 
 ```lean
 theorem encodeLat_decodeLat_roundtrip (x : ℚ) (hlo : -90 ≤ x) (hhi : x ≤ 90) :
-    BoundedRoundTrip encodeLat decodeLat aprs_epsilon x
+    BoundedRoundTrip encodeLat decodeLat latEpsilon x
 
 theorem encodeLon_decodeLon_roundtrip (x : ℚ) (hlo : -180 ≤ x) (hhi : x ≤ 180) :
     BoundedRoundTrip encodeLon decodeLon lonEpsilon x
@@ -73,7 +73,7 @@ theorem encodeLon_decodeLon_roundtrip (x : ℚ) (hlo : -180 ≤ x) (hhi : x ≤ 
 
 `BoundedRoundTrip enc dec ε x` states `|dec (enc x) - x| ≤ ε`. The bounds are:
 
-- `aprs_epsilon = 1/300000` — safe upper bound on the latitude round-trip error (the true bound is `1/latFactor = 1/380926`; the looser constant gives margin vs. the `1/12000` ties-to-even APRS LSB).
+- `latEpsilon = 1/300000` — safe upper bound on the latitude round-trip error (the true bound is `1/latFactor = 1/380926`; the looser constant gives margin vs. the `1/12000` ties-to-even APRS LSB).
 - `lonEpsilon = 1/150000` — same idea on the longitude side, where `lonFactor = 190463` (half of `latFactor`), so the worst-case error is roughly doubled.
 
 The proof chain (latitude; longitude mirrors it):

@@ -73,12 +73,12 @@ def decodeLon (s : String) : Rat :=
 -- The compressed Base91 latitude format has a worst-case round-trip
 -- error of 1 / latFactor = 1 / 380926 ≈ 2.6e-6 degrees, so we use a
 -- slightly looser 1/300000 as a safe upper bound.
-def aprs_epsilon : Rat := 1 / 300000
+def latEpsilon : Rat := 1 / 300000
 
 -- The compressed Base91 longitude format uses lonFactor = 190463
 -- (half of latFactor), so its worst-case round-trip error is twice
 -- that of latitude: ~1/190463 ≈ 5.25e-6 degrees. 1/150000 is a safe
--- upper bound chosen with the same margin philosophy as aprs_epsilon.
+-- upper bound chosen with the same margin philosophy as latEpsilon.
 def lonEpsilon : Rat := 1 / 150000
 
 -- 3. Define the Round-Trip Property
@@ -174,16 +174,16 @@ lemma encodeLat_in_range (x : ℚ) (hlo : -90 ≤ x) (hhi : x ≤ 90) :
 4. The main theorem: encode and decode satisfy BoundedRoundTrip for valid latitudes.
 -/
 theorem encodeLat_decodeLat_roundtrip (x : ℚ) (hlo : -90 ≤ x) (hhi : x ≤ 90) :
-    BoundedRoundTrip encodeLat decodeLat aprs_epsilon x := by
+    BoundedRoundTrip encodeLat decodeLat latEpsilon x := by
   constructor;
   · unfold decodeLat encodeLat;
-    unfold aprs_epsilon latFactor;
+    unfold latEpsilon latFactor;
     rw [ fromBase91_toBase91 ];
     · have := floor_error_nonneg ( ( 90 - x ) * 380926 ) ( by linarith );
       linarith!;
     · exact encodeLat_in_range x hlo hhi
   · unfold decodeLat encodeLat;
-    unfold aprs_epsilon latFactor;
+    unfold latEpsilon latFactor;
     rw [ fromBase91_toBase91 ];
     · have h_floor : (Int.toNat (Int.floor ((90 - x) * 380926))) ≤ (90 - x) * 380926 ∧ (90 - x) * 380926 < (Int.toNat (Int.floor ((90 - x) * 380926))) + 1 := by
         exact ⟨ by exact_mod_cast Nat.floor_le ( by linarith ), by exact_mod_cast Nat.lt_floor_add_one _ ⟩;
@@ -192,19 +192,19 @@ theorem encodeLat_decodeLat_roundtrip (x : ℚ) (hlo : -90 ≤ x) (hhi : x ≤ 9
 
 -- Test vectors for encodeLat/decodeLat (Latitude)
 
-example : BoundedRoundTrip encodeLat decodeLat aprs_epsilon (34.0) :=
+example : BoundedRoundTrip encodeLat decodeLat latEpsilon (34.0) :=
   encodeLat_decodeLat_roundtrip 34.0 (by norm_num) (by norm_num)
 
-example : BoundedRoundTrip encodeLat decodeLat aprs_epsilon (-42.5) :=
+example : BoundedRoundTrip encodeLat decodeLat latEpsilon (-42.5) :=
   encodeLat_decodeLat_roundtrip (-42.5) (by norm_num) (by norm_num)
 
-example : BoundedRoundTrip encodeLat decodeLat aprs_epsilon (0.0) :=
+example : BoundedRoundTrip encodeLat decodeLat latEpsilon (0.0) :=
   encodeLat_decodeLat_roundtrip 0.0 (by norm_num) (by norm_num)
 
-example : BoundedRoundTrip encodeLat decodeLat aprs_epsilon (90.0) :=
+example : BoundedRoundTrip encodeLat decodeLat latEpsilon (90.0) :=
   encodeLat_decodeLat_roundtrip 90.0 (by norm_num) (by norm_num)
 
-example : BoundedRoundTrip encodeLat decodeLat aprs_epsilon (-90.0) :=
+example : BoundedRoundTrip encodeLat decodeLat latEpsilon (-90.0) :=
   encodeLat_decodeLat_roundtrip (-90.0) (by norm_num) (by norm_num)
 
 -- You can evaluate the encodings directly to see the string and parsed outputs:
