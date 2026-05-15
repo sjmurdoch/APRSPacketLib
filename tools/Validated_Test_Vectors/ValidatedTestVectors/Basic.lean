@@ -41,7 +41,7 @@ def lonFactor : Rat := 190463
   Encodes Latitude.
   Formula: P = floor(380926 * (90 - lat))
 -/
-def encode (lat : Rat) : String :=
+def encodeLat (lat : Rat) : String :=
   let scaled := (90 - lat) * latFactor
   toBase91 scaled.floor.toNat 4
 
@@ -49,7 +49,7 @@ def encode (lat : Rat) : String :=
   Decodes Latitude.
   Formula: lat = 90 - (P / 380926)
 -/
-def decode (s : String) : Rat :=
+def decodeLat (s : String) : Rat :=
   let p := fromBase91 s
   90 - (p : Rat) / latFactor
 
@@ -70,21 +70,26 @@ def decodeLon (s : String) : Rat :=
   (x : Rat) / lonFactor - 180
 
 -- 2. Define the theoretical maximum error bound (ε).
--- For standard uncompressed APRS (DDMM.mm):
--- The least significant digit is 0.01 minutes.
--- 0.01 minutes = 1/100 of a minute = 1/6000 of a degree.
--- Ties-to-even rounding means the maximum error is half of that unit (1/12000),
--- but we define the full unit here as a safe upper bound epsilon.
+-- The compressed Base91 latitude format has a worst-case round-trip
+-- error of 1 / latFactor = 1 / 380926 ≈ 2.6e-6 degrees, so we use a
+-- slightly looser 1/300000 as a safe upper bound.
 def aprs_epsilon : Rat := 1 / 300000
+
+-- The compressed Base91 longitude format uses lonFactor = 190463
+-- (half of latFactor), so its worst-case round-trip error is twice
+-- that of latitude: ~1/190463 ≈ 5.25e-6 degrees. 1/150000 is a safe
+-- upper bound chosen with the same margin philosophy as aprs_epsilon.
+def lonEpsilon : Rat := 1 / 150000
 
 -- 3. Define the Round-Trip Property
 -- This Prop formally states that the difference between the
--- original coordinate and the round-tripped coordinate is within bounds.
-def BoundedRoundTrip (encode : Rat → String) (decode : String → Rat) (x : Rat) : Prop :=
+-- original coordinate and the round-tripped coordinate is within ε.
+def BoundedRoundTrip (encode : Rat → String) (decode : String → Rat)
+    (ε : Rat) (x : Rat) : Prop :=
   let decoded := decode (encode x)
   let diff := decoded - x
   -- -ε ≤ diff ≤ ε
-  (-aprs_epsilon) ≤ diff ∧ diff ≤ aprs_epsilon
+  (-ε) ≤ diff ∧ diff ≤ ε
 
 /-
 -
@@ -158,7 +163,7 @@ lemma floor_error_lt_one (q : ℚ) (_hq : 0 ≤ q) :
 /-
 The encoded value is in the valid base91 range for valid latitudes.
 -/
-lemma encode_in_range (x : ℚ) (hlo : -90 ≤ x) (hhi : x ≤ 90) :
+lemma encodeLat_in_range (x : ℚ) (hlo : -90 ≤ x) (hhi : x ≤ 90) :
     ((90 - x) * 380926).floor.toNat < 91 ^ 4 := by
   -- Since $\lfloor q \rfloor \leq q < \lfloor q \rfloor + 1$, we have $\lfloor q \rfloor < \lfloor q \rfloor + 1$.
   have h_floor_lt_succ : Int.toNat (Int.floor ((90 - x) * 380926)) < Int.floor ((90 - x) * 380926) + 1 := by
@@ -168,45 +173,98 @@ lemma encode_in_range (x : ℚ) (hlo : -90 ≤ x) (hhi : x ≤ 90) :
 /-
 4. The main theorem: encode and decode satisfy BoundedRoundTrip for valid latitudes.
 -/
-theorem encode_decode_roundtrip (x : ℚ) (hlo : -90 ≤ x) (hhi : x ≤ 90) :
-    BoundedRoundTrip encode decode x := by
+theorem encodeLat_decodeLat_roundtrip (x : ℚ) (hlo : -90 ≤ x) (hhi : x ≤ 90) :
+    BoundedRoundTrip encodeLat decodeLat aprs_epsilon x := by
   constructor;
-  · unfold decode encode;
+  · unfold decodeLat encodeLat;
     unfold aprs_epsilon latFactor;
     rw [ fromBase91_toBase91 ];
     · have := floor_error_nonneg ( ( 90 - x ) * 380926 ) ( by linarith );
       linarith!;
-    · exact encode_in_range x hlo hhi
-  · unfold decode encode;
+    · exact encodeLat_in_range x hlo hhi
+  · unfold decodeLat encodeLat;
     unfold aprs_epsilon latFactor;
     rw [ fromBase91_toBase91 ];
     · have h_floor : (Int.toNat (Int.floor ((90 - x) * 380926))) ≤ (90 - x) * 380926 ∧ (90 - x) * 380926 < (Int.toNat (Int.floor ((90 - x) * 380926))) + 1 := by
         exact ⟨ by exact_mod_cast Nat.floor_le ( by linarith ), by exact_mod_cast Nat.lt_floor_add_one _ ⟩;
       linarith!;
-    · exact encode_in_range x hlo hhi
+    · exact encodeLat_in_range x hlo hhi
 
--- Test vectors for encode/decode (Latitude)
+-- Test vectors for encodeLat/decodeLat (Latitude)
 
-example : BoundedRoundTrip encode decode (34.0) :=
+example : BoundedRoundTrip encodeLat decodeLat aprs_epsilon (34.0) :=
   encode_decode_roundtrip 34.0 (by norm_num) (by norm_num)
 
-example : BoundedRoundTrip encode decode (-42.5) :=
+example : BoundedRoundTrip encodeLat decodeLat aprs_epsilon (-42.5) :=
   encode_decode_roundtrip (-42.5) (by norm_num) (by norm_num)
 
-example : BoundedRoundTrip encode decode (0.0) :=
+example : BoundedRoundTrip encodeLat decodeLat aprs_epsilon (0.0) :=
   encode_decode_roundtrip 0.0 (by norm_num) (by norm_num)
 
-example : BoundedRoundTrip encode decode (90.0) :=
+example : BoundedRoundTrip encodeLat decodeLat aprs_epsilon (90.0) :=
   encode_decode_roundtrip 90.0 (by norm_num) (by norm_num)
 
-example : BoundedRoundTrip encode decode (-90.0) :=
+example : BoundedRoundTrip encodeLat decodeLat aprs_epsilon (-90.0) :=
   encode_decode_roundtrip (-90.0) (by norm_num) (by norm_num)
 
 -- You can evaluate the encodings directly to see the string and parsed outputs:
-#eval encode 34.0000004
-#eval 34.0000004 |> encode |> decode |> Rat.toFloat
+#eval encodeLat 34.0000004
+#eval 34.0000004 |> encodeLat |> decodeLat |> Rat.toFloat
 
 #eval encodeLon (-105.123)
 #eval -105.123 |> encodeLon |> decodeLon |> Rat.toFloat
+
+/-
+The encoded value is in the valid base91 range for valid longitudes.
+Mirrors `encodeLat_in_range`: at the extremes (x = -180 or x = 180),
+(180 + x) * 190463 reaches 0 or 360 * 190463 = 68566680, which is
+still below 91^4 = 68574961.
+-/
+lemma encodeLon_in_range (x : ℚ) (hlo : -180 ≤ x) (hhi : x ≤ 180) :
+    ((180 + x) * 190463).floor.toNat < 91 ^ 4 := by
+  have h_floor_lt_succ : Int.toNat (Int.floor ((180 + x) * 190463)) < Int.floor ((180 + x) * 190463) + 1 := by
+    rw [ Int.toNat_of_nonneg ( Int.floor_nonneg.mpr ( by linarith ) ) ] ; norm_num;
+  exact_mod_cast ( by linarith [ show ( ⌊ ( 180 + x ) * 190463⌋ : ℤ ) ≤ 91 ^ 4 - 1 by exact Int.le_sub_one_of_lt <| Int.floor_lt.2 <| by norm_num; linarith ] : ( Int.toNat ⌊ ( 180 + x ) * 190463⌋ : ℤ ) < 91 ^ 4 )
+
+/-
+The main theorem (longitude): encodeLon and decodeLon satisfy
+BoundedRoundTrip with lonEpsilon for valid longitudes in [-180, 180].
+-/
+theorem encodeLon_decodeLon_roundtrip (x : ℚ) (hlo : -180 ≤ x) (hhi : x ≤ 180) :
+    BoundedRoundTrip encodeLon decodeLon lonEpsilon x := by
+  -- For longitude, decode(encode x) = f/190463 - 180 where f = ⌊(180+x)*190463⌋.
+  -- So diff = f/190463 - (180+x) lies in (-1/190463, 0]. The branches' uses of the
+  -- floor lower/upper bound are mirrored relative to the latitude proof.
+  constructor;
+  · unfold decodeLon encodeLon;
+    unfold lonEpsilon lonFactor;
+    rw [ fromBase91_toBase91 ];
+    · have h_floor : (Int.toNat (Int.floor ((180 + x) * 190463))) ≤ (180 + x) * 190463 ∧ (180 + x) * 190463 < (Int.toNat (Int.floor ((180 + x) * 190463))) + 1 := by
+        exact ⟨ by exact_mod_cast Nat.floor_le ( by linarith ), by exact_mod_cast Nat.lt_floor_add_one _ ⟩;
+      linarith!;
+    · exact encodeLon_in_range x hlo hhi
+  · unfold decodeLon encodeLon;
+    unfold lonEpsilon lonFactor;
+    rw [ fromBase91_toBase91 ];
+    · have := floor_error_nonneg ( ( 180 + x ) * 190463 ) ( by linarith );
+      linarith!;
+    · exact encodeLon_in_range x hlo hhi
+
+-- Test vectors for encodeLon/decodeLon (Longitude)
+
+example : BoundedRoundTrip encodeLon decodeLon lonEpsilon (-105.123) :=
+  encodeLon_decodeLon_roundtrip (-105.123) (by norm_num) (by norm_num)
+
+example : BoundedRoundTrip encodeLon decodeLon lonEpsilon (0.0) :=
+  encodeLon_decodeLon_roundtrip 0.0 (by norm_num) (by norm_num)
+
+example : BoundedRoundTrip encodeLon decodeLon lonEpsilon (180.0) :=
+  encodeLon_decodeLon_roundtrip 180.0 (by norm_num) (by norm_num)
+
+example : BoundedRoundTrip encodeLon decodeLon lonEpsilon (-180.0) :=
+  encodeLon_decodeLon_roundtrip (-180.0) (by norm_num) (by norm_num)
+
+example : BoundedRoundTrip encodeLon decodeLon lonEpsilon (172.3456) :=
+  encodeLon_decodeLon_roundtrip 172.3456 (by norm_num) (by norm_num)
 
 def hello := "world"
