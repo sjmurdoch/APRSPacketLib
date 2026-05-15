@@ -1,84 +1,102 @@
 import ValidatedTestVectors
 import Mathlib
 
-open scoped BigOperators
-open scoped Real
-open scoped Nat
-open scoped Classical
-open scoped Pointwise
+/-! # Lean validator for `tools/aprs_vectors.json`
 
-/-! # Fixed-point test-vector emission
+  Reads pipe-delimited rows from stdin and reports, per row, whether
+  Lean's formally-proven `encodeLat`/`encodeLon`/`decodeLat`/`decodeLon`
+  agree with the bytes and decimal coordinates in the JSON.
 
-  Emits the JSON consumed by `tools/gen_aprs_vectors.py`. The
-  `base91_lat` and `base91_lon` fields are produced by `encodeLat`
-  and `encodeLon`, whose round-trip correctness is established by
-  `encodeLat_decodeLat_roundtrip` and `encodeLon_decodeLon_roundtrip`
-  in `ValidatedTestVectors.Basic`.
+  Invocation (from this directory):
 
-  The fixed-point list mirrors `FIXED_POINTS` in
-  `tools/gen_aprs_vectors.py`. The Python consumer cross-checks by
-  name and lat/lon string, so the two lists must stay in lock-step.
+      lake env lean --run Main.lean
+
+  Input format on stdin (one row per line):
+
+      <name>|<lat_deg>|<lon_deg>|<base91_lat>|<base91_lon>
+
+  `|` (ASCII 124) and `\n` (ASCII 10) lie outside the base-91 alphabet
+  (33..123), so neither needs escaping for any field carried below.
+
+  Tolerances
+  ----------
+
+  Encode side: byte equality. Lean computes `floor((90-x)*latFactor)`
+  over `Rat` (exact); Python's `gen_aprs_vectors.py` computes the same
+  floored integer over `Float`. For the canonical 6-decimal coordinates
+  in the JSON, the float and rational answers agree, so any byte
+  difference is a real bug, not a numeric artefact -- tolerance must be
+  zero.
+
+  Decode side: `latTol = 1 / latFactor`, `lonTol = 1 / lonFactor`. The
+  proven `BoundedRoundTrip` bound is `< 1/factor` exactly (combine
+  `floor_error_nonneg`, `floor_error_lt_one`, and `fromBase91_toBase91`
+  in `Basic.lean`). The `latEpsilon = 1/300000` / `lonEpsilon = 1/150000`
+  constants in `Basic.lean` are intentionally looser to give `linarith`
+  proof slack; they are unsuitable as validation tolerances and are
+  *not* used here.
 -/
 
-structure FixedPoint where
-  name   : String
-  lat    : Rat
-  lon    : Rat
-  latStr : String
-  lonStr : String
+/-- Tightest decode tolerances permitted by the floor-rule encoder. -/
+def latTol : Rat := 1 / latFactor
+def lonTol : Rat := 1 / lonFactor
 
-def fixedPoints : List FixedPoint := [
-  { name := "Munich",    lat :=  48.138630, lon :=  11.573410,
-    latStr :=  "48.138630", lonStr :=  "11.573410" },
-  { name := "CapeTown",  lat := -33.918861, lon :=  18.423300,
-    latStr := "-33.918861", lonStr :=  "18.423300" },
-  { name := "Auckland",  lat := -36.848460, lon := 174.762189,
-    latStr := "-36.848460", lonStr := "174.762189" },
-  { name := "NorthPole", lat :=  89.999000, lon :=   0.000000,
-    latStr :=  "89.999000", lonStr :=   "0.000000" },
-  { name := "Equator0",  lat :=   0.000000, lon :=   0.000000,
-    latStr :=   "0.000000", lonStr :=   "0.000000" }
-]
+def absRat (q : Rat) : Rat := if q < 0 then -q else q
 
-/-- Escape a string for safe inclusion as a JSON string literal.
-    `encodeLat`/`encodeLon` can emit `"` (ASCII 34) and `\` (ASCII 92);
-    everything else in the base-91 range (33–123) is JSON-safe. -/
-def jsonEscape (s : String) : String :=
-  s.foldl (fun acc c =>
-    match c with
-    | '"'  => acc ++ "\\\""
-    | '\\' => acc ++ "\\\\"
-    | c    => acc.push c) ""
+/-- Parse a signed decimal string like `-33.918861` into a `Rat`.
+    Accepts the strict format the Python generator emits:
+    `-?\d+\.\d{6}` (or `-?\d+` if no fractional part). -/
+def parseRat (s : String) : Rat :=
+  let (sign, body) : Rat × String :=
+    if s.startsWith "-" then (-1, (s.drop 1).toString) else (1, s)
+  match body.splitOn "." with
+  | [w] =>
+      sign * ((w.toNat?.getD 0 : Int) : Rat)
+  | [w, f] =>
+      let denom : Rat := (10 ^ f.length : Nat)
+      let intPart  : Rat := ((w.toNat?.getD 0 : Int) : Rat)
+      let fracPart : Rat := ((f.toNat?.getD 0 : Nat) : Rat)
+      sign * (intPart + fracPart / denom)
+  | _ => 0
 
-def jsonQuote (s : String) : String :=
-  "\"" ++ jsonEscape s ++ "\""
+structure RowResult where
+  ok      : Bool
+  message : String
 
-def renderPoint (p : FixedPoint) : String :=
-  let encLat := encodeLat p.lat
-  let encLon := encodeLon p.lon
-  "    {" ++
-    "\"name\": "       ++ jsonQuote p.name ++
-    ", \"lat_deg\": "  ++ p.latStr ++
-    ", \"lon_deg\": "  ++ p.lonStr ++
-    ", \"base91_lat\": " ++ jsonQuote encLat ++
-    ", \"base91_lon\": " ++ jsonQuote encLon ++
-  "}"
-
-def renderJson : String :=
-  let entries := fixedPoints.map renderPoint
-  let body    := String.intercalate ",\n" entries
-  "{\n" ++
-  "  \"_generator\": \"tools/ValidatedTestVectors (Lean) — encodeLat/encodeLon\",\n" ++
-  "  \"_proven_fields\": [\"base91_lat\", \"base91_lon\"],\n" ++
-  "  \"_theorems\": [\"encodeLat_decodeLat_roundtrip\", \"encodeLon_decodeLon_roundtrip\"],\n" ++
-  "  \"_lat_factor\": 380926,\n" ++
-  "  \"_lon_factor\": 190463,\n" ++
-  "  \"fixed_points\": [\n" ++
-  body ++ "\n" ++
-  "  ]\n" ++
-  "}\n"
+def validateRow (line : String) : RowResult :=
+  match line.splitOn "|" with
+  | [name, latS, lonS, expLat, expLon] =>
+      let lat := parseRat latS
+      let lon := parseRat lonS
+      let gotLatStr := encodeLat lat
+      let gotLonStr := encodeLon lon
+      let decLat    := decodeLat expLat
+      let decLon    := decodeLon expLon
+      let latDiff   := absRat (decLat - lat)
+      let lonDiff   := absRat (decLon - lon)
+      let errs : List String :=
+        (if gotLatStr = expLat then [] else
+          [s!"encodeLat: got {gotLatStr.quote} expected {expLat.quote}"]) ++
+        (if gotLonStr = expLon then [] else
+          [s!"encodeLon: got {gotLonStr.quote} expected {expLon.quote}"]) ++
+        (if latDiff ≤ latTol then [] else
+          [s!"decodeLat: |{decLat} - {lat}| = {latDiff} > latTol={latTol}"]) ++
+        (if lonDiff ≤ lonTol then [] else
+          [s!"decodeLon: |{decLon} - {lon}| = {lonDiff} > lonTol={lonTol}"])
+      match errs with
+      | [] => { ok := true,  message := s!"OK   {name}" }
+      | _  => { ok := false, message := s!"FAIL {name}: " ++ String.intercalate "; " errs }
+  | _ =>
+      { ok := false, message := s!"FAIL malformed row: {line}" }
 
 def main : IO Unit := do
-  let path := "proved_vectors.json"
-  IO.FS.writeFile path renderJson
-  IO.println s!"wrote {path} ({fixedPoints.length} fixed points)"
+  let stdin ← IO.getStdin
+  let input ← stdin.readToEnd
+  let lines := input.splitOn "\n" |>.filter (fun l => ¬ l.isEmpty)
+  let results := lines.map validateRow
+  for r in results do IO.println r.message
+  let okCount   := results.filter (·.ok)        |>.length
+  let failCount := results.filter (fun r => ¬ r.ok) |>.length
+  IO.println s!"-- {okCount} OK, {failCount} FAIL"
+  if failCount > 0 then
+    IO.Process.exit 1
