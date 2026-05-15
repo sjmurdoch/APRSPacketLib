@@ -266,5 +266,3 @@ example : BoundedRoundTrip encodeLon decodeLon lonEpsilon (-180.0) :=
 
 example : BoundedRoundTrip encodeLon decodeLon lonEpsilon (172.3456) :=
   encodeLon_decodeLon_roundtrip 172.3456 (by norm_num) (by norm_num)
-
-def hello := "world"

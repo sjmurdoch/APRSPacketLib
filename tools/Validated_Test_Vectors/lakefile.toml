@@ -2,6 +2,23 @@ name = "Validated_Test_Vectors"
 version = "0.1.0"
 defaultTargets = ["validated_test_vectors"]
 
+# Project-wide elaborator and pretty-printer options. Applied to every
+# Lean file in the package; previously duplicated at the top of Main.lean.
+[leanOptions]
+maxHeartbeats = 8000000
+maxRecDepth = 4000
+synthInstance.maxHeartbeats = 20000
+synthInstance.maxSize = 128
+relaxedAutoImplicit = false
+autoImplicit = false
+pp.fullNames = true
+pp.structureInstances = true
+pp.coercions.types = true
+pp.funBinderTypes = true
+pp.letVarTypes = true
+pp.piBinderTypes = true
+grind.warning = false
+
 [[require]]
 name = "mathlib"
 git = "https://github.com/leanprover-community/mathlib4.git"
