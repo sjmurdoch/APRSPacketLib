@@ -1,0 +1,14 @@
+{
+  "_generator": "tools/Validated_Test_Vectors (Lean) — encodeLat/encodeLon",
+  "_proven_fields": ["base91_lat", "base91_lon"],
+  "_theorems": ["encodeLat_decodeLat_roundtrip", "encodeLon_decodeLon_roundtrip"],
+  "_lat_factor": 380926,
+  "_lon_factor": 190463,
+  "fixed_points": [
+    {"name": "Munich", "lat_deg": 48.138630, "lon_deg": 11.573410, "base91_lat": "6/Y`", "base91_lon": "QG2."},
+    {"name": "CapeTown", "lat_deg": -33.918861, "lon_deg": 18.423300, "base91_lat": "_[9A", "base91_lon": "S.cx"},
+    {"name": "Auckland", "lat_deg": -36.848460, "lon_deg": 174.762189, "base91_lat": "a,#\\", "base91_lon": "z]Q8"},
+    {"name": "NorthPole", "lat_deg": 89.999000, "lon_deg": 0.000000, "base91_lat": "!!%1", "base91_lon": "NN!!"},
+    {"name": "Equator0", "lat_deg": 0.000000, "lon_deg": 0.000000, "base91_lat": "NN!!", "base91_lon": "NN!!"}
+  ]
+}

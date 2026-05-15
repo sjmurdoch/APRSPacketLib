@@ -2,14 +2,22 @@
 """Generate APRS test vectors covering the Base91 (compressed) format.
 
 Produces test/common/aprs_vectors.h, which Unity tests under
-test/test_base91_*/ consume. All vectors are derived from APRS
-Protocol Reference v1.2 §9 ("Compressed Position Report Data
-Formats") — the script makes no calls into APRSPacketLib, so test
-asserts compare library output against an independent oracle.
+test/test_base91_*/ consume. The lat/lon base-91 bytes are imported
+from `tools/Validated_Test_Vectors/proved_vectors.json` — generated
+by a Lean 4 program whose `encodeLat`/`encodeLon` round-trip
+correctness is formally proven (see `Validated_Test_Vectors/
+ValidatedTestVectors/Basic.lean`). All other fields are derived
+locally from the spec formulas; aprslib is consulted as a
+third-party cross-check.
 
 Re-run after editing the case lists below:
 
     tools/.venv/bin/python tools/gen_aprs_vectors.py
+
+If you edit the fixed-point list, the same list must be updated in
+`tools/Validated_Test_Vectors/Main.lean`, then re-run:
+
+    cd tools/Validated_Test_Vectors && lake env lean --run Main.lean
 
 The header contains:
 
@@ -18,16 +26,18 @@ The header contains:
     against aprslib (rossengeorgiev/aprs-python) when installed.
 
   * kBase91FixedPoints — five hand-picked sites (Munich, Cape Town,
-    Auckland, North Pole, Equator-0) with the full set of base91
-    fields derived from the spec formulas. Used by the encode and
-    round-trip tests.
+    Auckland, North Pole, Equator-0). lat/lon come from the Lean
+    oracle; course/speed/altitude come from the spec formulas in
+    this file.
 
-The generator aborts loudly if aprslib disagrees with the spec
-formulas — meaning the generator itself is wrong.
+The generator aborts loudly if aprslib disagrees with the emitted
+bytes — meaning either the Lean oracle or this script's auxiliary
+encoders are wrong.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import sys
 import warnings
@@ -59,6 +69,20 @@ FIXED_POINTS = [
 
 OUT = Path(__file__).resolve().parent.parent / "test" / "common" / "aprs_vectors.h"
 
+# Spec-faithful base-91 lat/lon are produced by the Lean project at
+# tools/Validated_Test_Vectors/. We consume the JSON it emits rather
+# than re-encoding here, so the bytes that land in aprs_vectors.h are
+# the ones whose round-trip property is formally proven (theorems
+# encodeLat_decodeLat_roundtrip and encodeLon_decodeLon_roundtrip).
+#
+# Regenerate the JSON with:
+#     cd tools/Validated_Test_Vectors && lake env lean --run Main.lean
+PROVED_VECTORS = (
+    Path(__file__).resolve().parent
+    / "Validated_Test_Vectors"
+    / "proved_vectors.json"
+)
+
 # T-byte ('compression type'). The library always emits 'G' for the
 # course/speed slot and 'Q' for the altitude slot; the spec leaves the
 # source / NMEA bits implementation-defined for our use, and these
@@ -81,15 +105,43 @@ def base91_pack(value: int, width: int) -> str:
 
 
 def encode_lat_base91(lat_deg: float) -> str:
-    """APRS12c §9: YYYY = base91( 380926 * (90 - lat_deg) )."""
-    v = round(380926 * (90.0 - lat_deg))
+    """APRS12c §9: YYYY = base91( floor(380926 * (90 - lat_deg)) ).
+
+    Reference implementation kept for cross-checking the Lean output.
+    The spec's worked example on p.38 of APRS Protocol Reference v1.2
+    is decisive about flooring (190463 * 107.25 = 20427156.75 is
+    quoted as 20427156, not rounded to 20427157). Production
+    fixed-point bytes come from `load_proved_vectors`, not from this
+    function.
+    """
+    v = math.floor(380926 * (90.0 - lat_deg))
     return base91_pack(v, 4)
 
 
 def encode_lon_base91(lon_deg: float) -> str:
-    """APRS12c §9: XXXX = base91( 190463 * (180 + lon_deg) )."""
-    v = round(190463 * (180.0 + lon_deg))
+    """APRS12c §9: XXXX = base91( floor(190463 * (180 + lon_deg)) ).
+    See `encode_lat_base91` for the floor rationale."""
+    v = math.floor(190463 * (180.0 + lon_deg))
     return base91_pack(v, 4)
+
+
+def load_proved_vectors() -> dict:
+    """Load the JSON emitted by tools/Validated_Test_Vectors/Main.lean.
+
+    The Lean program is the source of truth for the `base91_lat` and
+    `base91_lon` fields used by `build_fixed_point_records`. We refuse
+    to run if the file is missing — silently falling back to the
+    Python encoder would defeat the point of consuming a formally
+    proven oracle.
+    """
+    if not PROVED_VECTORS.exists():
+        raise SystemExit(
+            f"ERROR: {PROVED_VECTORS} not found.\n"
+            "       Regenerate with:\n"
+            "         cd tools/Validated_Test_Vectors && "
+            "lake env lean --run Main.lean"
+        )
+    return json.loads(PROVED_VECTORS.read_text())
 
 
 def encode_course(course_deg: int) -> str:
@@ -209,9 +261,34 @@ def cross_check_fixed_points(points) -> list[str]:
     return failures
 
 
-def build_fixed_point_records(points):
+def build_fixed_point_records(points, proved):
+    """Compose a fixed-point record per FIXED_POINTS entry.
+
+    `base91_lat` and `base91_lon` come from the Lean-emitted JSON
+    (`proved`). The remaining fields (course/speed/altitude) are
+    derived locally from the spec formulas — those encoders are not
+    yet formally proven.
+    """
+    by_name = {p["name"]: p for p in proved["fixed_points"]}
     records = []
     for name, lat, lon, course, speed, alt_m in points:
+        if name not in by_name:
+            raise SystemExit(
+                f"ERROR: fixed point {name!r} missing from {PROVED_VECTORS}. "
+                "The Lean fixedPoints list in Main.lean must match "
+                "FIXED_POINTS in this script."
+            )
+        proved_p = by_name[name]
+        # Sanity-check that the Lean program's view of this point's
+        # coordinates matches ours, to first-order. The JSON carries
+        # lat/lon as decimal numbers; we tolerate ≤1e-9 deg slack
+        # purely as a guard against literal-precision quirks.
+        for field, ours in (("lat_deg", lat), ("lon_deg", lon)):
+            if abs(proved_p[field] - ours) > 1e-9:
+                raise SystemExit(
+                    f"ERROR: {name} {field} disagrees: "
+                    f"FIXED_POINTS={ours}, proved={proved_p[field]}"
+                )
         # Library's `int altitude` parameter is in feet (per AGENTS.md
         # 'Units on the wire'). Caller (firmware) does the m→ft
         # conversion. Pre-compute and ship both.
@@ -226,8 +303,8 @@ def build_fixed_point_records(points):
                 "speed_kn": speed,
                 "altitude_m": alt_m,
                 "altitude_ft": alt_ft,
-                "base91_lat": encode_lat_base91(lat),
-                "base91_lon": encode_lon_base91(lon),
+                "base91_lat": proved_p["base91_lat"],
+                "base91_lon": proved_p["base91_lon"],
                 "base91_c": encode_course(course),
                 "base91_s": encode_speed(speed),
                 "base91_alt_c": alt_c,
@@ -338,11 +415,12 @@ def emit_header(course_vecs, speed_vecs, fixed_points) -> None:
 
 
 def main() -> int:
+    proved = load_proved_vectors()
     course_vecs = [(encode_course(c), c) for c in COURSE_CASES_DEG]
     speed_vecs = [
         (encode_speed(s), decode_speed_kmh(encode_speed(s))) for s in SPEED_CASES_KN
     ]
-    fixed_points = build_fixed_point_records(FIXED_POINTS)
+    fixed_points = build_fixed_point_records(FIXED_POINTS, proved)
 
     failures = cross_check_course_speed(course_vecs, speed_vecs)
     failures += cross_check_fixed_points(fixed_points)

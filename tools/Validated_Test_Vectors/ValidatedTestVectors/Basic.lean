@@ -193,19 +193,19 @@ theorem encodeLat_decodeLat_roundtrip (x : ℚ) (hlo : -90 ≤ x) (hhi : x ≤ 9
 -- Test vectors for encodeLat/decodeLat (Latitude)
 
 example : BoundedRoundTrip encodeLat decodeLat aprs_epsilon (34.0) :=
-  encode_decode_roundtrip 34.0 (by norm_num) (by norm_num)
+  encodeLat_decodeLat_roundtrip 34.0 (by norm_num) (by norm_num)
 
 example : BoundedRoundTrip encodeLat decodeLat aprs_epsilon (-42.5) :=
-  encode_decode_roundtrip (-42.5) (by norm_num) (by norm_num)
+  encodeLat_decodeLat_roundtrip (-42.5) (by norm_num) (by norm_num)
 
 example : BoundedRoundTrip encodeLat decodeLat aprs_epsilon (0.0) :=
-  encode_decode_roundtrip 0.0 (by norm_num) (by norm_num)
+  encodeLat_decodeLat_roundtrip 0.0 (by norm_num) (by norm_num)
 
 example : BoundedRoundTrip encodeLat decodeLat aprs_epsilon (90.0) :=
-  encode_decode_roundtrip 90.0 (by norm_num) (by norm_num)
+  encodeLat_decodeLat_roundtrip 90.0 (by norm_num) (by norm_num)
 
 example : BoundedRoundTrip encodeLat decodeLat aprs_epsilon (-90.0) :=
-  encode_decode_roundtrip (-90.0) (by norm_num) (by norm_num)
+  encodeLat_decodeLat_roundtrip (-90.0) (by norm_num) (by norm_num)
 
 -- You can evaluate the encodings directly to see the string and parsed outputs:
 #eval encodeLat 34.0000004
