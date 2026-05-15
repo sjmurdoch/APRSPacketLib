@@ -1,5 +1,5 @@
 {
-  "_generator": "tools/Validated_Test_Vectors (Lean) — encodeLat/encodeLon",
+  "_generator": "tools/ValidatedTestVectors (Lean) — encodeLat/encodeLon",
   "_proven_fields": ["base91_lat", "base91_lon"],
   "_theorems": ["encodeLat_decodeLat_roundtrip", "encodeLon_decodeLon_roundtrip"],
   "_lat_factor": 380926,

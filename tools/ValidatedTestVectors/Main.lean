@@ -68,7 +68,7 @@ def renderJson : String :=
   let entries := fixedPoints.map renderPoint
   let body    := String.intercalate ",\n" entries
   "{\n" ++
-  "  \"_generator\": \"tools/Validated_Test_Vectors (Lean) — encodeLat/encodeLon\",\n" ++
+  "  \"_generator\": \"tools/ValidatedTestVectors (Lean) — encodeLat/encodeLon\",\n" ++
   "  \"_proven_fields\": [\"base91_lat\", \"base91_lon\"],\n" ++
   "  \"_theorems\": [\"encodeLat_decodeLat_roundtrip\", \"encodeLon_decodeLon_roundtrip\"],\n" ++
   "  \"_lat_factor\": 380926,\n" ++

@@ -1,4 +1,4 @@
-name = "Validated_Test_Vectors"
+name = "ValidatedTestVectors"
 version = "0.1.0"
 defaultTargets = ["validated_test_vectors"]
 

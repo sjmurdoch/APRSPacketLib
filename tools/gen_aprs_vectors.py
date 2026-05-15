@@ -3,9 +3,9 @@
 
 Produces test/common/aprs_vectors.h, which Unity tests under
 test/test_base91_*/ consume. The lat/lon base-91 bytes are imported
-from `tools/Validated_Test_Vectors/proved_vectors.json` — generated
+from `tools/ValidatedTestVectors/proved_vectors.json` — generated
 by a Lean 4 program whose `encodeLat`/`encodeLon` round-trip
-correctness is formally proven (see `Validated_Test_Vectors/
+correctness is formally proven (see `ValidatedTestVectors/
 ValidatedTestVectors/Basic.lean`). All other fields are derived
 locally from the spec formulas; aprslib is consulted as a
 third-party cross-check.
@@ -15,9 +15,9 @@ Re-run after editing the case lists below:
     tools/.venv/bin/python tools/gen_aprs_vectors.py
 
 If you edit the fixed-point list, the same list must be updated in
-`tools/Validated_Test_Vectors/Main.lean`, then re-run:
+`tools/ValidatedTestVectors/Main.lean`, then re-run:
 
-    cd tools/Validated_Test_Vectors && lake env lean --run Main.lean
+    cd tools/ValidatedTestVectors && lake env lean --run Main.lean
 
 The header contains:
 
@@ -70,16 +70,16 @@ FIXED_POINTS = [
 OUT = Path(__file__).resolve().parent.parent / "test" / "common" / "aprs_vectors.h"
 
 # Spec-faithful base-91 lat/lon are produced by the Lean project at
-# tools/Validated_Test_Vectors/. We consume the JSON it emits rather
+# tools/ValidatedTestVectors/. We consume the JSON it emits rather
 # than re-encoding here, so the bytes that land in aprs_vectors.h are
 # the ones whose round-trip property is formally proven (theorems
 # encodeLat_decodeLat_roundtrip and encodeLon_decodeLon_roundtrip).
 #
 # Regenerate the JSON with:
-#     cd tools/Validated_Test_Vectors && lake env lean --run Main.lean
+#     cd tools/ValidatedTestVectors && lake env lean --run Main.lean
 PROVED_VECTORS = (
     Path(__file__).resolve().parent
-    / "Validated_Test_Vectors"
+    / "ValidatedTestVectors"
     / "proved_vectors.json"
 )
 
@@ -126,7 +126,7 @@ def encode_lon_base91(lon_deg: float) -> str:
 
 
 def load_proved_vectors() -> dict:
-    """Load the JSON emitted by tools/Validated_Test_Vectors/Main.lean.
+    """Load the JSON emitted by tools/ValidatedTestVectors/Main.lean.
 
     The Lean program is the source of truth for the `base91_lat` and
     `base91_lon` fields used by `build_fixed_point_records`. We refuse
@@ -138,7 +138,7 @@ def load_proved_vectors() -> dict:
         raise SystemExit(
             f"ERROR: {PROVED_VECTORS} not found.\n"
             "       Regenerate with:\n"
-            "         cd tools/Validated_Test_Vectors && "
+            "         cd tools/ValidatedTestVectors && "
             "lake env lean --run Main.lean"
         )
     return json.loads(PROVED_VECTORS.read_text())

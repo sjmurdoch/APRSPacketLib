@@ -1,4 +1,4 @@
-# Validated_Test_Vectors
+# ValidatedTestVectors
 
 A standalone Lean 4 / Mathlib project that formally proves the round-trip
 correctness of the APRS Base91 compressed-position encoding used by the rest of
