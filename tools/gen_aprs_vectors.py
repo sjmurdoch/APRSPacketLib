@@ -223,11 +223,30 @@ def cross_check_course_speed(course_vecs, speed_vecs) -> list[str]:
 
 def cross_check_fixed_points(points) -> list[str]:
     """Round-trip each spec-encoded fixed point through aprslib's parser
-    and verify decoded lat/lon come back within format resolution."""
+    and verify decoded lat/lon land within one encoding-resolution unit
+    of the original — the tightest symmetric tolerance compatible with
+    the spec's floor-based encoder.
+
+    Caveat: a single-integer disagreement in the encoded value (e.g., a
+    round-up encoder where the spec mandates floor) lands inside this
+    window because rounded-up bytes decode strictly closer to the input
+    than floor bytes. That class of bug is caught by byte-equality with
+    proved_vectors.json upstream, not here.
+    """
     try:
         import aprslib
     except ImportError:
         return []
+
+    # The encoder resolution: one ULP at the encoded-integer level
+    # translates to 1/factor degrees of latitude or longitude.
+    # aprslib's float arithmetic contributes errors ~10⁷× smaller, so
+    # using exactly 1/factor as the threshold leaves no room for noise
+    # to crowd it.
+    tolerances = {
+        "latitude":  1.0 / 380926,   # ≈ 2.625e-6 deg
+        "longitude": 1.0 / 190463,   # ≈ 5.251e-6 deg
+    }
 
     failures: list[str] = []
     for p in points:
@@ -247,15 +266,16 @@ def cross_check_fixed_points(points) -> list[str]:
             failures.append(f"{p['name']}: aprslib raised {exc!r}")
             continue
 
-        # Base91 lat resolution is ~1/380926 deg ≈ 0.3 m. Allow 1e-4 deg
-        # to absorb any rounding the parser does internally.
         for field, expected in (("latitude", p["lat_deg"]),
                                 ("longitude", p["lon_deg"])):
             got = parsed.get(field)
-            if got is None or abs(got - expected) > 1e-4:
+            tol = tolerances[field]
+            if got is None or abs(got - expected) >= tol:
+                residual = None if got is None else got - expected
                 failures.append(
                     f"{p['name']}: {field} expected {expected}, "
-                    f"aprslib decoded {got}"
+                    f"aprslib decoded {got} "
+                    f"(residual {residual!r}, tolerance {tol:.3e} deg)"
                 )
 
     return failures
