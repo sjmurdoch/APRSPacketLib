@@ -210,17 +210,29 @@ def encode_course(course_deg: int) -> str:
     with c constrained to numeric 0..89 (encoded course ∈ {0,4,…,356}).
     The spec does not write an encoder formula or state a rounding mode
     for the inversion; we round-to-nearest because it matches direwolf
-    and aprslib round-trip behaviour and halves the worst-case encode
-    error vs. truncation."""
-    return chr(round(course_deg / 4) + 33)
+    and halves the worst-case encode error vs. truncation. Direwolf's
+    `(course + 2) / 4` integer expression rounds ties away from zero
+    (for the non-negative course range that compressed positions cover);
+    C's `lroundf` does the same.
+
+    `int(x + 0.5)` rather than Python's `round()`: Python's `round` is
+    banker's (ties to even); we want ties-away-from-zero to match C's
+    `lroundf` and direwolf. For course_deg ≥ 0 (the only legal input
+    range), `int(x + 0.5)` gives round-half-up, which coincides with
+    ties-away on the non-negative reals. The lat/lon encoder above
+    uses the same pattern for the same reason."""
+    return chr(int(course_deg / 4 + 0.5) + 33)
 
 
 def encode_speed(speed_kn: int) -> str:
     """APRS12c §9 'Course/Speed' (p. 39) gives only the decoder direction:
         'speed = 1.08^s – 1'  (knots)
     Inverting under round-to-nearest (same rounding-mode caveat as
-    encode_course) gives s = round(log_1.08(speed + 1))."""
-    return chr(round(math.log(speed_kn + 1) / math.log(1.08)) + 33)
+    encode_course) gives s = round(log_1.08(speed + 1)). Same
+    `int(x + 0.5)` ties-away rationale as encode_course; direwolf's
+    `s = (int)round(log(speed+1.0)/log(1.08))` in `set_comp_position`
+    uses C99 `round()`, which is also ties-away."""
+    return chr(int(math.log(speed_kn + 1) / math.log(1.08) + 0.5) + 33)
 
 
 def encode_altitude(altitude_ft: int) -> tuple[str, str]:
