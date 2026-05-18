@@ -87,6 +87,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import re
 import shutil
@@ -94,6 +95,8 @@ import subprocess
 import sys
 import warnings
 from pathlib import Path
+
+logger = logging.getLogger("gen_aprs_vectors")
 
 # aprslib 0.7.2 has unescaped backslashes in its regex literals,
 # tripping SyntaxWarning under Python 3.12+. Filter once at import time.
@@ -388,7 +391,7 @@ def _render_json(course_vecs, speed_vecs, fixed_points) -> str:
 def cmd_generate(args: argparse.Namespace) -> int:
     course_vecs, speed_vecs, fixed_points = _build_records()
     args.json.write_text(_render_json(course_vecs, speed_vecs, fixed_points))
-    print(f"wrote {args.json}", file=sys.stderr)
+    logger.info("wrote %s", args.json)
     return 0
 
 
@@ -492,7 +495,7 @@ def _render_header(data: dict) -> str:
 def cmd_header(args: argparse.Namespace) -> int:
     data = json.loads(args.json.read_text())
     args.header.write_text(_render_header(data))
-    print(f"wrote {args.header}", file=sys.stderr)
+    logger.info("wrote %s", args.header)
     return 0
 
 
@@ -504,10 +507,9 @@ def cmd_validate_aprslib(args: argparse.Namespace) -> int:
     try:
         import aprslib  # type: ignore[import-not-found]
     except ImportError:
-        print(
-            "ERROR: aprslib not installed. Install with:\n"
-            "  uv pip install --python tools/.venv/bin/python aprslib",
-            file=sys.stderr,
+        logger.error(
+            "aprslib not installed. Install with:\n"
+            "  uv pip install --python tools/.venv/bin/python aprslib"
         )
         return 2
 
@@ -565,7 +567,13 @@ def cmd_validate_aprslib(args: argparse.Namespace) -> int:
             # behaviour, not a §9 mandate.
             expected_course = 360 if cv["course_deg"] == 0 else cv["course_deg"]
             got_course = parsed.get("course")
-            if got_course != expected_course:
+            course_ok = got_course == expected_course
+            logger.debug(
+                "aprslib course byte %r: ours=%s°, aprslib=%s° [%s]",
+                c_byte, expected_course, got_course,
+                "PASS" if course_ok else "FAIL",
+            )
+            if not course_ok:
                 failures.append(
                     f"course byte {c_byte!r}: expected {expected_course}°, "
                     f"aprslib got {got_course}°"
@@ -573,7 +581,17 @@ def cmd_validate_aprslib(args: argparse.Namespace) -> int:
 
             spec_kmh = decode_speed_kn(s_byte) * 1.852
             got_speed = parsed.get("speed")
-            if got_speed is None or abs(got_speed - spec_kmh) > _SPEED_TOL_KMH:
+            speed_ok = got_speed is not None and abs(got_speed - spec_kmh) <= _SPEED_TOL_KMH
+            speed_residual = (
+                "n/a" if got_speed is None else f"{got_speed - spec_kmh:+.3e}"
+            )
+            logger.debug(
+                "aprslib speed byte %r: ours=%.6f km/h, aprslib=%s km/h, "
+                "residual=%s, tol=%.1e [%s]",
+                s_byte, spec_kmh, got_speed, speed_residual, _SPEED_TOL_KMH,
+                "PASS" if speed_ok else "FAIL",
+            )
+            if not speed_ok:
                 failures.append(
                     f"speed byte {s_byte!r}: spec {spec_kmh} km/h, "
                     f"aprslib {got_speed} km/h "
@@ -599,23 +617,32 @@ def cmd_validate_aprslib(args: argparse.Namespace) -> int:
             ("longitude", p["lon_deg"], _LON_TOL_DEG),
         ):
             got = parsed.get(field)
-            if got is None or abs(got - expected) >= tol:
-                residual = None if got is None else got - expected
+            ok = got is not None and abs(got - expected) < tol
+            residual = "n/a" if got is None else f"{got - expected:+.3e}"
+            logger.debug(
+                "aprslib %s %s: ours=%s, aprslib=%s, residual=%s, "
+                "tol=%.3e [%s]",
+                p["name"], field, expected, got, residual, tol,
+                "PASS" if ok else "FAIL",
+            )
+            if not ok:
+                residual_val = None if got is None else got - expected
                 failures.append(
                     f"{p['name']}: {field} expected {expected}, "
-                    f"aprslib decoded {got} (residual {residual!r}, "
+                    f"aprslib decoded {got} (residual {residual_val!r}, "
                     f"tolerance {tol:.3e} deg)"
                 )
 
     if failures:
-        print("FAIL: aprslib disagrees with JSON-recorded vectors:", file=sys.stderr)
+        logger.warning("FAIL: aprslib disagrees with JSON-recorded vectors:")
         for f in failures:
-            print(f"  - {f}", file=sys.stderr)
+            logger.warning("  - %s", f)
         return 1
-    print(
-        f"OK: {len(data['course_vectors'])} course × "
-        f"{len(data['speed_vectors'])} speed pairs and "
-        f"{len(data['fixed_points'])} fixed points round-trip through aprslib"
+    logger.info(
+        "OK: %d course × %d speed pairs and %d fixed points round-trip through aprslib",
+        len(data['course_vectors']),
+        len(data['speed_vectors']),
+        len(data['fixed_points']),
     )
     return 0
 
@@ -639,8 +666,12 @@ def cmd_validate_lean(args: argparse.Namespace) -> int:
         )
     stdin = "\n".join(rows) + "\n"
 
+    logger.debug("validate-lean: sending %d rows to Lean validator", len(rows))
+    for row in rows:
+        logger.debug("  -> %s", row)
+
     if not args.lean_cwd.exists():
-        print(f"ERROR: --lean-cwd {args.lean_cwd} not found", file=sys.stderr)
+        logger.error("--lean-cwd %s not found", args.lean_cwd)
         return 2
 
     # `lake env lean --run Main.lean` is the macOS-safe invocation
@@ -658,13 +689,15 @@ def cmd_validate_lean(args: argparse.Namespace) -> int:
             check=False,
         )
     except FileNotFoundError:
-        print(
-            "ERROR: `lake` not found on PATH. Install elan and Lean's lake:\n"
-            "  curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh",
-            file=sys.stderr,
+        logger.error(
+            "`lake` not found on PATH. Install elan and Lean's lake:\n"
+            "  curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh"
         )
         return 2
 
+    # Lean does its own per-row comparisons and prints them; surface its
+    # output verbatim so its formatting (and pass/fail reporting) is
+    # preserved. We don't re-parse it -- the return code is authoritative.
     sys.stdout.write(proc.stdout)
     if proc.stderr:
         sys.stderr.write(proc.stderr)
@@ -859,11 +892,10 @@ def _encode_via_direwolf(
 def cmd_validate_direwolf(args: argparse.Namespace) -> int:
     exe = shutil.which("decode_aprs")
     if not exe:
-        print(
-            "ERROR: `decode_aprs` not found on PATH. Install Direwolf:\n"
+        logger.error(
+            "`decode_aprs` not found on PATH. Install Direwolf:\n"
             "  brew install direwolf      # macOS\n"
-            "  apt-get install direwolf   # Debian/Ubuntu",
-            file=sys.stderr,
+            "  apt-get install direwolf   # Debian/Ubuntu"
         )
         return 2
 
@@ -926,7 +958,13 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
             # aprslib applies — see cmd_validate_aprslib for the spec
             # citations). Compare against the raw JSON value.
             got_course = got.get("course")
-            if got_course != cv["course_deg"]:
+            course_ok = got_course == cv["course_deg"]
+            logger.debug(
+                "direwolf course byte %r: ours=%s°, direwolf=%s° [%s]",
+                c_byte, cv["course_deg"], got_course,
+                "PASS" if course_ok else "FAIL",
+            )
+            if not course_ok:
                 failures.append(
                     f"course byte {c_byte!r}: expected {cv['course_deg']}°, "
                     f"direwolf got {got_course}°"
@@ -938,7 +976,15 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
             # whenever the float lies within 0.5 of an integer.
             spec_kmh = decode_speed_kn(s_byte) * 1.852
             got_kmh = got.get("speed_kmh")
-            if got_kmh is None or abs(got_kmh - spec_kmh) > _SPEED_TOL_KMH:
+            speed_ok = got_kmh is not None and abs(got_kmh - spec_kmh) <= _SPEED_TOL_KMH
+            speed_residual = "n/a" if got_kmh is None else f"{got_kmh - spec_kmh:+.3f}"
+            logger.debug(
+                "direwolf speed byte %r: ours=%.3f km/h, direwolf=%s km/h, "
+                "residual=%s, tol=±%s km/h [%s]",
+                s_byte, spec_kmh, got_kmh, speed_residual, _SPEED_TOL_KMH,
+                "PASS" if speed_ok else "FAIL",
+            )
+            if not speed_ok:
                 failures.append(
                     f"speed byte {s_byte!r}: spec {spec_kmh:.3f} km/h, "
                     f"direwolf got {got_kmh} km/h "
@@ -965,11 +1011,19 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
             ("longitude", p["lon_deg"], _LON_TOL_DEG),
         ):
             v = got.get(field)
-            if v is None or abs(v - expected) > tol:
-                residual = None if v is None else v - expected
+            ok = v is not None and abs(v - expected) <= tol
+            residual = "n/a" if v is None else f"{v - expected:+.3e}"
+            logger.debug(
+                "direwolf %s %s: ours=%s, direwolf=%s, residual=%s, "
+                "tol=%.3e [%s]",
+                p["name"], field, expected, v, residual, tol,
+                "PASS" if ok else "FAIL",
+            )
+            if not ok:
+                residual_val = None if v is None else v - expected
                 failures.append(
                     f"{p['name']}: {field} expected {expected}, "
-                    f"direwolf got {v} (residual {residual!r}, "
+                    f"direwolf got {v} (residual {residual_val!r}, "
                     f"tolerance {tol:.3e} deg)"
                 )
 
@@ -986,7 +1040,15 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
 
         v = got.get("altitude_m")
         alt_tol = _alt_tol_m(p["altitude_m"])
-        if v is None or abs(v - p["altitude_m"]) > alt_tol:
+        alt_ok = v is not None and abs(v - p["altitude_m"]) <= alt_tol
+        alt_residual = "n/a" if v is None else f"{v - p['altitude_m']:+d}"
+        logger.debug(
+            "direwolf %s altitude_m: ours=%d, direwolf=%s, residual=%s m, "
+            "tol=±%d m [%s]",
+            p["name"], p["altitude_m"], v, alt_residual, alt_tol,
+            "PASS" if alt_ok else "FAIL",
+        )
+        if not alt_ok:
             failures.append(
                 f"{p['name']}: altitude_m expected {p['altitude_m']}, "
                 f"direwolf got {v} (tolerance ±{alt_tol} m)"
@@ -1043,7 +1105,13 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
                     ("lat", p["base91_lat"], lat_bytes),
                     ("lon", p["base91_lon"], lon_bytes),
                 ):
-                    if got_bytes != expected_bytes:
+                    bytes_ok = got_bytes == expected_bytes
+                    logger.debug(
+                        "direwolf encode %s %s bytes: ours=%r, direwolf=%r [%s]",
+                        p["name"], field, expected_bytes, got_bytes,
+                        "PASS" if bytes_ok else "FAIL",
+                    )
+                    if not bytes_ok:
                         failures.append(
                             f"encode {p['name']}: {field} bytes expected "
                             f"{expected_bytes!r}, direwolf emitted "
@@ -1052,14 +1120,21 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
                         )
                 dw_lat = 90.0  - base91_unpack(lat_bytes) / lat_factor
                 dw_lon = base91_unpack(lon_bytes) / lon_factor - 180.0
-                for field, exp, got, tol in (
-                    ("lat", p["lat_deg"], dw_lat, _ENCODE_TOL_LAT_DEG),
-                    ("lon", p["lon_deg"], dw_lon, _ENCODE_TOL_LON_DEG),
+                for field, exp, got, tol, raw_bytes in (
+                    ("lat", p["lat_deg"], dw_lat, _ENCODE_TOL_LAT_DEG, lat_bytes),
+                    ("lon", p["lon_deg"], dw_lon, _ENCODE_TOL_LON_DEG, lon_bytes),
                 ):
-                    if abs(got - exp) > tol:
+                    rt_ok = abs(got - exp) <= tol
+                    logger.debug(
+                        "direwolf encode %s %s round-trip: ours=%s, "
+                        "direwolf=%r -> %s, residual=%+.3e, tol=%.3e [%s]",
+                        p["name"], field, exp, raw_bytes, got, got - exp, tol,
+                        "PASS" if rt_ok else "FAIL",
+                    )
+                    if not rt_ok:
                         failures.append(
                             f"encode {p['name']}: {field} input {exp}, "
-                            f"direwolf encoded {lat_bytes if field=='lat' else lon_bytes!r} "
+                            f"direwolf encoded {raw_bytes!r} "
                             f"-> {got} (residual {got - exp:.3e}, "
                             f"tolerance {tol:.3e} deg)"
                         )
@@ -1072,16 +1147,17 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
         )
 
     if failures:
-        print("FAIL: direwolf disagrees with JSON-recorded vectors:", file=sys.stderr)
+        logger.warning("FAIL: direwolf disagrees with JSON-recorded vectors:")
         for f in failures:
-            print(f"  - {f}", file=sys.stderr)
+            logger.warning("  - %s", f)
         return 1
-    print(
-        f"OK: {len(data['course_vectors'])} course × "
-        f"{len(data['speed_vectors'])} speed pairs and "
-        f"{len(data['fixed_points'])} fixed points (×2 cs/alt) decode, "
-        f"plus {len(data['fixed_points'])} encode round-trips, "
-        f"all match direwolf within spec tolerance"
+    logger.info(
+        "OK: %d course × %d speed pairs and %d fixed points (×2 cs/alt) decode, "
+        "plus %d encode round-trips, all match direwolf within spec tolerance",
+        len(data['course_vectors']),
+        len(data['speed_vectors']),
+        len(data['fixed_points']),
+        len(data['fixed_points']),
     )
     return 0
 
@@ -1096,6 +1172,18 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Generate, emit, and validate APRS test vectors. "
                     "See module docstring for the full pipeline.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "-v", "--verbose",
+        action="count",
+        default=0,
+        help="increase log verbosity (-v for DEBUG: per-comparison detail "
+             "in validate-* subcommands)",
+    )
+    p.add_argument(
+        "-q", "--quiet",
+        action="store_true",
+        help="suppress INFO-level output; only warnings and errors are shown",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -1128,6 +1216,23 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    if args.quiet:
+        level = logging.WARNING
+    elif args.verbose >= 1:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    # Configure the root handler at WARNING so noisy third-party
+    # libraries (aprslib emits DEBUG-per-parse-step) stay quiet, and
+    # bump only our own logger to the requested level. Levels are
+    # filtered at the originating logger before propagation, so our
+    # DEBUG/INFO records still reach the root handler.
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(levelname)s %(message)s",
+        stream=sys.stderr,
+    )
+    logger.setLevel(level)
     return args.func(args)
 
 
