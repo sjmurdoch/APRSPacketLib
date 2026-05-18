@@ -52,23 +52,26 @@ Subcommands
                        Decode pass: each course×speed pair and each
                        fixed point (twice -- cs slot carrying
                        course/speed, then altitude) is piped through
-                       `decode_aprs(1)` and the parsed lat/lon,
-                       course, speed and altitude are compared to the
-                       JSON values at the tightest spec-justified
-                       tolerance. Encode pass: each fixed point is
-                       fed to `direwolf` via PBEACON COMPRESS=1,
-                       the emitted base91 lat/lon bytes are captured
-                       from the monitor log and compared two ways:
-                       (a) byte-exact equality against our recorded
-                       bytes (expected, since both we and direwolf
-                       now round to nearest), and (b) decoded back
-                       via the spec formula to within half an encoder
-                       ULP of the input. Requires `decode_aprs` and
-                       `direwolf` on PATH and an audio device with at
-                       least one input channel (`brew install
-                       direwolf` on macOS, plus a virtual loopback
-                       like BlackHole 2ch if no real input device is
-                       present).
+                       `decode_aprs(1)` and direwolf's parsed lat/
+                       lon, course, speed and altitude are compared
+                       against a Python re-decode of the same byte
+                       (decode_lat_base91 / decode_lon_base91 /
+                       decode_course / decode_speed_kn /
+                       decode_altitude_base91_m). Tolerance is
+                       direwolf-print-precision only -- no encoder
+                       loss enters this comparison. Encode pass:
+                       each fixed point is fed to `direwolf` via
+                       PBEACON COMPRESS=1, the emitted base91 lat/
+                       lon bytes are captured from the monitor log
+                       and compared byte-for-byte against our
+                       recorded bytes (zero tolerance). Encoder-vs-
+                       decoder round trip is covered separately by
+                       cmd_generate's self-tests. Requires
+                       `decode_aprs` and `direwolf` on PATH and an
+                       audio device with at least one input channel
+                       (`brew install direwolf` on macOS, plus a
+                       virtual loopback like BlackHole 2ch if no
+                       real input device is present).
 
 Bit-stable regeneration
 -----------------------
@@ -82,10 +85,16 @@ Validation tolerances
 ---------------------
 
 Tolerances are picked at the tightest spec-/arithmetic-justified value
-and the rationale lives next to each constant. See `_LAT_TOL_DEG`,
-`_LON_TOL_DEG`, `_SPEED_TOL_KMH` in `cmd_validate_aprslib` /
-`cmd_validate_direwolf`, the altitude `_alt_tol_m` in
-`cmd_validate_direwolf`, and the matching constants in `Main.lean`.
+and the rationale lives next to each constant. The validate-aprslib
+and validate-direwolf comparisons are framed as Python-spec-decode vs.
+third-party-decode (or our-bytes vs. direwolf-bytes for the encoder
+pass), so encoder loss is structurally absent from these bounds --
+they cover float noise and presentation-layer rounding only. The
+encoder-vs-decoder round-trip is proven separately by
+`_self_test_records` in `cmd_generate`. See `_LAT_TOL_DEG`,
+`_LON_TOL_DEG`, `_SPEED_TOL_KMH`, `_ALT_TOL_M` in
+`cmd_validate_aprslib` / `cmd_validate_direwolf`, and the matching
+constants in `Main.lean`.
 """
 
 from __future__ import annotations
@@ -366,6 +375,25 @@ def decode_speed_kn(s_byte: str) -> float:
     return 1.08 ** (ord(s_byte) - 33) - 1
 
 
+def decode_course(c_byte: str) -> int:
+    """APRS12c §9 'Course/Speed' (p. 39): course = c × 4, c ∈ 0..89.
+
+    Pure spec-formula inverse of encode_course. The caller is
+    responsible for any presentation-layer remapping (e.g. aprslib's
+    0 → 360 convention borrowed from Mic-E §10)."""
+    return (ord(c_byte) - 33) * 4
+
+
+def decode_altitude_base91_m(c_byte: str, s_byte: str) -> float:
+    """APRS12c §9 'Altitude' (p. 40): altitude = 1.002^cs ft, then
+    × 0.3048 to metres. Pure spec formula in Python double precision —
+    no rounding on this side, so the caller can apply whichever
+    rounding the oracle being compared against uses (direwolf prints
+    rounded int metres)."""
+    cs = (ord(c_byte) - 33) * 91 + (ord(s_byte) - 33)
+    return (1.002 ** cs) * 0.3048
+
+
 def decode_speed_kmh(s_byte: str) -> int:
     """Spec-formula decode in km/h, rounded to int.
 
@@ -421,6 +449,143 @@ def _build_records():
             "base91_alt_s": alt_s,
         })
     return course_vecs, speed_vecs, fixed_points
+
+
+def _self_test_records(course_vecs, speed_vecs, fixed_points) -> None:
+    """Run Python encode/decode self-tests on every row before JSON is
+    written. Failure raises RuntimeError naming the offending row.
+
+    The validate-aprslib and validate-direwolf subcommands now compare
+    third-party implementations against our Python re-decode (not
+    against the encoder input), so encoder loss is structurally absent
+    from those tolerances. This self-test closes the loop by bounding
+    Python encode→decode residuals against the spec-quantization
+    limits; a failure here means the encoder/decoder pair in this file
+    is internally inconsistent and the JSON should not reach disk.
+    """
+    # Lat/lon: round-to-nearest encoder, so the encode→decode residual
+    # is at most half a ULP (≈1.3e-6 deg lat / ≈2.6e-6 deg lon). Also
+    # check that decoding then re-encoding the recorded bytes
+    # round-trips exactly — every value on the encoded grid must map
+    # back to itself.
+    LAT_RESIDUAL = 0.5 / LAT_FACTOR + 1e-12
+    LON_RESIDUAL = 0.5 / LON_FACTOR + 1e-12
+    for fp in fixed_points:
+        enc_lat = fp["base91_lat"]
+        dec_lat = decode_lat_base91(enc_lat)
+        lat_residual = dec_lat - fp["lat_deg"]
+        logger.debug(
+            "self-test lat %s: input=%s → bytes=%r → decoded=%s, "
+            "residual=%+.3e, bound=±%.3e",
+            fp["name"], fp["lat_deg"], enc_lat, dec_lat,
+            lat_residual, LAT_RESIDUAL,
+        )
+        if abs(lat_residual) > LAT_RESIDUAL:
+            raise RuntimeError(
+                f"self-test lat: {fp['name']} input {fp['lat_deg']} → "
+                f"bytes {enc_lat!r} → decoded {dec_lat} "
+                f"(residual {lat_residual:+.3e}, "
+                f"bound ±{LAT_RESIDUAL:.3e})"
+            )
+        if encode_lat_base91(dec_lat) != enc_lat:
+            raise RuntimeError(
+                f"self-test lat: {fp['name']} decode→encode does not "
+                f"round-trip ({enc_lat!r} → {dec_lat} → "
+                f"{encode_lat_base91(dec_lat)!r})"
+            )
+        enc_lon = fp["base91_lon"]
+        dec_lon = decode_lon_base91(enc_lon)
+        lon_residual = dec_lon - fp["lon_deg"]
+        logger.debug(
+            "self-test lon %s: input=%s → bytes=%r → decoded=%s, "
+            "residual=%+.3e, bound=±%.3e",
+            fp["name"], fp["lon_deg"], enc_lon, dec_lon,
+            lon_residual, LON_RESIDUAL,
+        )
+        if abs(lon_residual) > LON_RESIDUAL:
+            raise RuntimeError(
+                f"self-test lon: {fp['name']} input {fp['lon_deg']} → "
+                f"bytes {enc_lon!r} → decoded {dec_lon} "
+                f"(residual {lon_residual:+.3e}, "
+                f"bound ±{LON_RESIDUAL:.3e})"
+            )
+        if encode_lon_base91(dec_lon) != enc_lon:
+            raise RuntimeError(
+                f"self-test lon: {fp['name']} decode→encode does not "
+                f"round-trip ({enc_lon!r} → {dec_lon} → "
+                f"{encode_lon_base91(dec_lon)!r})"
+            )
+
+    # Course: every COURSE_CASES_DEG entry is a multiple of 4, so both
+    # directions of the round trip are exact.
+    for byte, c_deg in course_vecs:
+        logger.debug(
+            "self-test course: input=%d° → byte=%r → decoded=%d°",
+            c_deg, byte, decode_course(byte),
+        )
+        if encode_course(c_deg) != byte:
+            raise RuntimeError(
+                f"self-test course: encode_course({c_deg}) = "
+                f"{encode_course(c_deg)!r}, expected {byte!r}"
+            )
+        if decode_course(byte) != c_deg:
+            raise RuntimeError(
+                f"self-test course: decode_course({byte!r}) = "
+                f"{decode_course(byte)}, expected {c_deg}"
+            )
+
+    # Speed: round-to-nearest encoder in log_1.08 space, so the
+    # decoded knots sit within a multiplicative √1.08 of (v_in + 1).
+    # Symmetric bound: |v_out − v_in| ≤ (√1.08 − 1)(v_in + 1) + ε.
+    HALF_ULP_FACTOR = math.sqrt(1.08) - 1.0    # ≈ 0.03923
+    for byte, v_in, _kmh in speed_vecs:
+        v_out = decode_speed_kn(byte)
+        bound = HALF_ULP_FACTOR * (v_in + 1) + 1e-9
+        speed_residual = v_out - v_in
+        logger.debug(
+            "self-test speed: input=%d kn → byte=%r → decoded=%.6f kn, "
+            "residual=%+.3e, bound=±%.3e",
+            v_in, byte, v_out, speed_residual, bound,
+        )
+        if abs(speed_residual) > bound:
+            raise RuntimeError(
+                f"self-test speed: input {v_in} kn → byte {byte!r} → "
+                f"decoded {v_out:.6f} kn (residual {speed_residual:+.3e}, "
+                f"bound ±{bound:.3e})"
+            )
+
+    # Altitude: truncating encoder in log_1.002 space, so decoded ft
+    # sits in [ft_in / 1.002, ft_in]. After × 0.3048 metres and the
+    # m_in → ft_in rounding done in _build_records (±0.5 ft ≈ ±0.15
+    # m), the combined bound is |m_out − m_in| ≤ m_in × 0.002 + 1 + ε.
+    # (For m_in = 0 the encoder short-circuits to ('!','!'), decoded
+    # as 1.002^0 × 0.3048 = 0.3048 m — well inside the 1 m floor.)
+    for fp in fixed_points:
+        m_in = fp["altitude_m"]
+        m_out = decode_altitude_base91_m(
+            fp["base91_alt_c"], fp["base91_alt_s"]
+        )
+        bound = m_in * 0.002 + 1.0 + 1e-9
+        alt_residual = m_out - m_in
+        logger.debug(
+            "self-test altitude %s: input=%d m → bytes=(%r, %r) → "
+            "decoded=%.3f m, residual=%+.3f, bound=±%.3f",
+            fp["name"], m_in, fp["base91_alt_c"], fp["base91_alt_s"],
+            m_out, alt_residual, bound,
+        )
+        if abs(alt_residual) > bound:
+            raise RuntimeError(
+                f"self-test altitude: {fp['name']} input {m_in} m → "
+                f"bytes ({fp['base91_alt_c']!r}, {fp['base91_alt_s']!r}) "
+                f"→ decoded {m_out:.3f} m "
+                f"(residual {alt_residual:+.3f}, bound ±{bound:.3f})"
+            )
+
+    logger.info(
+        "self-test: %d fixed points (lat/lon/alt) + %d courses + %d speeds "
+        "round-trip within spec-quantization bounds",
+        len(fixed_points), len(course_vecs), len(speed_vecs),
+    )
 
 
 def _json_string(s: str) -> str:
@@ -507,6 +672,7 @@ def _render_json(course_vecs, speed_vecs, fixed_points) -> str:
 
 def cmd_generate(args: argparse.Namespace) -> int:
     course_vecs, speed_vecs, fixed_points = _build_records()
+    _self_test_records(course_vecs, speed_vecs, fixed_points)
     args.json.write_text(_render_json(course_vecs, speed_vecs, fixed_points))
     logger.info("wrote %s", args.json)
     return 0
@@ -639,9 +805,10 @@ def cmd_validate_aprslib(args: argparse.Namespace) -> int:
         "validate-aprslib: aprslib's parser decodes each JSON-recorded "
         "byte; we re-decode the same byte in Python and compare."
     )
-    logger.info("  Course: ours = cv['course_deg'] from the JSON (with c=0 "
-                "remapped to 360 to match aprslib's 0=unknown/360=due-north "
-                "convention from §10 Mic-E).")
+    logger.info("  Course: ours = decode_course(c_byte) — spec formula "
+                "(ord(c)-33)*4 applied to the JSON's recorded byte, with "
+                "0 remapped to 360 to match aprslib's 0=unknown/360=due-north "
+                "convention from §10 Mic-E.")
     logger.info("  Speed:  ours = decode_speed_kn(s_byte) * 1.852 — spec "
                 "formula 1.08^(s-33)-1 kn converted to km/h, as Python float.")
     logger.info("  Lat:    ours = decode_lat_base91(p['base91_lat']) — spec "
@@ -706,8 +873,13 @@ def cmd_validate_aprslib(args: argparse.Namespace) -> int:
             # convention when decoding compressed course bytes too
             # (c = 0 → reported course 360), so we match it here to
             # make the cross-check pass. This is observed aprslib
-            # behaviour, not a §9 mandate.
-            expected_course = 360 if cv["course_deg"] == 0 else cv["course_deg"]
+            # behaviour, not a §9 mandate. Run the spec formula on the
+            # recorded byte (rather than reading cv["course_deg"] back
+            # from the JSON) so the framing is "Python re-decode vs
+            # aprslib decode" and the test survives future c-bytes
+            # that aren't exact multiples of 4.
+            spec_course = decode_course(c_byte)
+            expected_course = 360 if spec_course == 0 else spec_course
             got_course = parsed.get("course")
             course_ok = got_course == expected_course
             logger.debug(
@@ -1074,21 +1246,27 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
         "(decode_aprs(1)) and encode (direwolf PBEACON COMPRESS=1)."
     )
     logger.info("Decode pass — we hand direwolf each JSON-recorded byte and "
-                "read its parsed values back from its text output:")
-    logger.info("  Course: ours = cv['course_deg'] from the JSON. Compared "
+                "read its parsed values back from its text output. Every "
+                "'ours' value below is a Python re-decode of the same byte "
+                "the input handed to direwolf, never the encoder input — so "
+                "the residual is direwolf-vs-Python decoder disagreement "
+                "only, with no encoder loss baked in:")
+    logger.info("  Course: ours = decode_course(c_byte) — spec formula "
+                "(ord(c)-33)*4 applied to the recorded byte. Compared "
                 "against decode_aprs's 'course=' field (exact integer match).")
     logger.info("  Speed:  ours = decode_speed_kn(s_byte) * 1.852 — spec "
                 "float in km/h. Compared against decode_aprs's printed km/h "
                 "integer to within ±0.5 (half-LSB of direwolf's rounding).")
-    logger.info("  Lat:    ours = p['lat_deg'] — the encoder INPUT from "
-                "FIXED_POINTS. Compared against decode_aprs's reconstructed "
-                "decimal degrees; tolerance absorbs encoder half-ULP plus "
-                "decode_aprs's DD MM.mmmm print truncation.")
-    logger.info("  Lon:    ours = p['lon_deg'] — same shape as lat.")
-    logger.info("  Alt:    ours = p['altitude_m'] — encoder INPUT. Compared "
-                "against decode_aprs's printed metre integer; tolerance "
-                "absorbs log_1.002 encode quantization + direwolf's int "
-                "rounding.")
+    logger.info("  Lat:    ours = decode_lat_base91(p['base91_lat']) — spec "
+                "formula 90 - N/380926. Compared against decode_aprs's "
+                "DD MM.mmmm reconstruction; tolerance covers print "
+                "half-LSB (~8.3e-7 deg) only.")
+    logger.info("  Lon:    ours = decode_lon_base91(p['base91_lon']) — same "
+                "shape as lat.")
+    logger.info("  Alt:    ours = decode_altitude_base91_m(c, s) — spec "
+                "formula 1.002^cs × 0.3048. Compared against decode_aprs's "
+                "printed metre integer to within ±0.5 (half-LSB of direwolf's "
+                "rounding).")
     logger.info(
         "Encode pass — we feed FIXED_POINTS lat/lon as PBEACON SOURCE/LAT/LONG "
         "to direwolf and capture the base91 bytes it emits on the air "
@@ -1098,23 +1276,26 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
     )
     logger.info("  Bytes:  ours = p['base91_lat']/p['base91_lon'] — our "
                 "spec-formula encoded bytes. Compared byte-for-byte against "
-                "direwolf's emitted bytes (exact equality is expected since "
-                "both round to nearest).")
-    logger.info("  Round-trip: ours = p['lat_deg']/p['lon_deg'] — the encoder "
-                "INPUT. Direwolf's emitted bytes are decoded back through our "
-                "base91_unpack + spec formula and compared to that input "
-                "within encoder half-ULP.")
+                "direwolf's emitted bytes (zero tolerance — both we and "
+                "direwolf round to nearest, so any divergence is a real "
+                "cross-impl encoder disagreement). Encoder-vs-decoder round "
+                "trip is proven by cmd_generate's self-tests, not here.")
 
     # Tolerance rationale (kept here, not at module top, so it sits
     # next to the comparison it governs):
     #
-    # _LAT_TOL_DEG / _LON_TOL_DEG: the encoder rounds to nearest, so
-    # encode error is at most half a ULP (≈1.3e-6 deg lat /
-    # ≈2.6e-6 deg lon). decode_aprs prints `DD MM.mmmm`, so the
-    # readback adds half-of-last-digit ≈ 0.5 * 1e-4 / 60 ≈ 8.3e-7
-    # deg — which doesn't shrink with the encoder migration. Use the
-    # half-ULP bound plus a 1e-6 slack covering the print truncation
-    # plus float noise.
+    # Each 'ours' value in this decode pass is a Python re-decode of
+    # the same byte handed to direwolf (not the encoder input). So the
+    # only source of disagreement is the gap between direwolf's
+    # presentation layer (DD MM.mmmm for lat/lon, rounded integer
+    # km/h, rounded integer m) and our Python float decode — encoder
+    # quantization is structurally absent from these bounds.
+    #
+    # _LAT_TOL_DEG / _LON_TOL_DEG: decode_aprs prints `DD MM.mmmm`,
+    # so the readback adds half-of-last-digit ≈ 0.5 × 1e-4 / 60 ≈
+    # 8.3e-7 deg. 1e-6 gives ~20% margin over the theoretical floor
+    # and a round-number constant; widen to 2e-6 if banker's-rounding
+    # on the last digit makes residuals borderline.
     #
     # _SPEED_TOL_KMH: direwolf prints km/h as a rounded integer.
     # Comparing direwolf's integer against the closed-form spec float
@@ -1122,18 +1303,14 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
     # rounding); the +1e-9 sliver covers float noise so the bound is
     # not literally 0.5 in edge cases.
     #
-    # _alt_tol_m(m): encoder is `int(log_1.002(ft))` -- one ULP in
-    # log space means ft is recovered within a multiplicative factor
-    # of 1.002, i.e. up to `m * 0.002` metres lost. direwolf rounds
-    # the metre value when printing, adding another ±1 m. Combined
-    # bound: `ceil(m * 0.002) + 1` metres. Scales naturally with
-    # altitude -- the NorthPole 5000 m case sits at ±11 m, sea-level
-    # cases at ±1 m.
-    _LAT_TOL_DEG   = 0.5 / lat_factor + 1e-6
-    _LON_TOL_DEG   = 0.5 / lon_factor + 1e-6
+    # _ALT_TOL_M: direwolf prints metres as a rounded integer.
+    # Comparing that integer against decode_altitude_base91_m's
+    # closed-form float has a worst-case gap of 0.5 m (half-LSB);
+    # +1e-9 covers float noise. Same shape as the speed bound.
+    _LAT_TOL_DEG = 1e-6
+    _LON_TOL_DEG = 1e-6
     _SPEED_TOL_KMH = 0.5 + 1e-9
-    def _alt_tol_m(m: int) -> int:
-        return math.ceil(m * 0.002) + 1
+    _ALT_TOL_M = 0.5 + 1e-9
 
     failures: list[str] = []
 
@@ -1153,17 +1330,21 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
             # decode_aprs prints encoded-course 0 as 0 (not 360, the
             # uncompressed/Mic-E 0=unknown/360=due-north convention
             # aprslib applies — see cmd_validate_aprslib for the spec
-            # citations). Compare against the raw JSON value.
+            # citations). Compare against the Python spec re-decode of
+            # the same byte; framing the test as Python-vs-direwolf
+            # (not JSON-input-vs-direwolf) keeps the validator's job
+            # to "cross-impl decoder comparison" only.
+            spec_course = decode_course(c_byte)
             got_course = got.get("course")
-            course_ok = got_course == cv["course_deg"]
+            course_ok = got_course == spec_course
             logger.debug(
                 "direwolf decode course byte %r: ours=%s°, direwolf=%s° [%s]",
-                c_byte, cv["course_deg"], got_course,
+                c_byte, spec_course, got_course,
                 "PASS" if course_ok else "FAIL",
             )
             if not course_ok:
                 failures.append(
-                    f"course byte {c_byte!r}: expected {cv['course_deg']}°, "
+                    f"course byte {c_byte!r}: expected {spec_course}°, "
                     f"direwolf got {got_course}°"
                 )
 
@@ -1205,8 +1386,8 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
             continue
 
         for field, expected, tol in (
-            ("latitude",  p["lat_deg"], _LAT_TOL_DEG),
-            ("longitude", p["lon_deg"], _LON_TOL_DEG),
+            ("latitude",  decode_lat_base91(p["base91_lat"]), _LAT_TOL_DEG),
+            ("longitude", decode_lon_base91(p["base91_lon"]), _LON_TOL_DEG),
         ):
             v = got.get(field)
             ok = v is not None and abs(v - expected) <= tol
@@ -1237,19 +1418,21 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
             continue
 
         v = got.get("altitude_m")
-        alt_tol = _alt_tol_m(p["altitude_m"])
-        alt_ok = v is not None and abs(v - p["altitude_m"]) <= alt_tol
-        alt_residual = "n/a" if v is None else f"{v - p['altitude_m']:+d}"
+        expected_alt_m = decode_altitude_base91_m(
+            p["base91_alt_c"], p["base91_alt_s"]
+        )
+        alt_ok = v is not None and abs(v - expected_alt_m) <= _ALT_TOL_M
+        alt_residual = "n/a" if v is None else f"{v - expected_alt_m:+.3f}"
         logger.debug(
-            "direwolf decode %s altitude_m: ours=%d, direwolf=%s, residual=%s m, "
-            "tol=±%d m [%s]",
-            p["name"], p["altitude_m"], v, alt_residual, alt_tol,
+            "direwolf decode %s altitude_m: ours=%.3f, direwolf=%s, "
+            "residual=%s m, tol=±%.3f m [%s]",
+            p["name"], expected_alt_m, v, alt_residual, _ALT_TOL_M,
             "PASS" if alt_ok else "FAIL",
         )
         if not alt_ok:
             failures.append(
-                f"{p['name']}: altitude_m expected {p['altitude_m']}, "
-                f"direwolf got {v} (tolerance ±{alt_tol} m)"
+                f"{p['name']}: altitude_m expected {expected_alt_m:.3f}, "
+                f"direwolf got {v} (tolerance ±{_ALT_TOL_M} m)"
             )
 
     # ---- encode pass: drive direwolf's compressed-position encoder ----
@@ -1259,17 +1442,13 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
     # course/speed bytes (the cs slot is the two-space "no-data"
     # sentinel) and writes altitude as the comment-style
     # `/A=NNNNNN` block rather than packing it into cs with T='Q'.
-    # That leaves lat/lon as the only base91 fields direwolf produces,
-    # so this pass round-trips those alone.
+    # That leaves lat/lon as the only base91 fields direwolf produces.
     #
-    # Tolerance: 0.5/factor + 1e-12 (half a ULP, since both our
-    # encoder and direwolf round to nearest -- so byte-exact
-    # agreement with direwolf is *expected*, not just round-trip-
-    # within-ULP). The base91 byte equality is also checked below as
-    # a separate failure so any future divergence (regression on our
-    # side, direwolf behaviour change, or someone re-introducing
-    # truncation) surfaces explicitly instead of hiding inside the
-    # round-trip slack.
+    # This pass is pure encoder-vs-encoder: zero tolerance, byte-exact
+    # equality only. The encoder→decoder round-trip property (encode
+    # → decode within encoder loss) lives in cmd_generate's self-test
+    # so it runs unconditionally on every regeneration, not just when
+    # direwolf happens to be installed.
     encode_direwolf = shutil.which("direwolf")
     if encode_direwolf:
         audio_device = _direwolf_pick_audio_device(encode_direwolf, cwd)
@@ -1283,8 +1462,6 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
             captured = _encode_via_direwolf(
                 data["fixed_points"], encode_direwolf, audio_device, cwd
             )
-            _ENCODE_TOL_LAT_DEG = 0.5 / lat_factor + 1e-12
-            _ENCODE_TOL_LON_DEG = 0.5 / lon_factor + 1e-12
             for i, p in enumerate(data["fixed_points"]):
                 src = f"TEST{i + 1}"
                 bytes_pair = captured.get(src)
@@ -1294,11 +1471,6 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
                     )
                     continue
                 lat_bytes, lon_bytes = bytes_pair
-                # Byte-equality check: under round-to-nearest both we
-                # and direwolf should land on the same encoded bytes.
-                # If they ever diverge, the round-trip-within-ULP test
-                # below would still pass (the residual is half a ULP
-                # in either direction), so check bytes explicitly.
                 for field, expected_bytes, got_bytes in (
                     ("lat", p["base91_lat"], lat_bytes),
                     ("lon", p["base91_lon"], lon_bytes),
@@ -1313,28 +1485,8 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
                         failures.append(
                             f"encode {p['name']}: {field} bytes expected "
                             f"{expected_bytes!r}, direwolf emitted "
-                            f"{got_bytes!r} (byte-exact agreement is "
-                            f"expected post-round-to-nearest migration)"
-                        )
-                dw_lat = 90.0  - base91_unpack(lat_bytes) / lat_factor
-                dw_lon = base91_unpack(lon_bytes) / lon_factor - 180.0
-                for field, exp, got, tol, raw_bytes in (
-                    ("lat", p["lat_deg"], dw_lat, _ENCODE_TOL_LAT_DEG, lat_bytes),
-                    ("lon", p["lon_deg"], dw_lon, _ENCODE_TOL_LON_DEG, lon_bytes),
-                ):
-                    rt_ok = abs(got - exp) <= tol
-                    logger.debug(
-                        "direwolf encode %s %s round-trip: ours=%s, "
-                        "direwolf=%r -> %s, residual=%+.3e, tol=%.3e [%s]",
-                        p["name"], field, exp, raw_bytes, got, got - exp, tol,
-                        "PASS" if rt_ok else "FAIL",
-                    )
-                    if not rt_ok:
-                        failures.append(
-                            f"encode {p['name']}: {field} input {exp}, "
-                            f"direwolf encoded {raw_bytes!r} "
-                            f"-> {got} (residual {got - exp:.3e}, "
-                            f"tolerance {tol:.3e} deg)"
+                            f"{got_bytes!r} (zero tolerance — both we and "
+                            f"direwolf round to nearest)"
                         )
     else:
         # decode_aprs is present (checked above) but the daemon binary
@@ -1350,8 +1502,9 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
             logger.warning("  - %s", f)
         return 1
     logger.info(
-        "OK: %d course × %d speed pairs and %d fixed points (×2 cs/alt) decode, "
-        "plus %d encode round-trips, all match direwolf within spec tolerance",
+        "OK: %d course × %d speed pairs and %d fixed points (×2 cs/alt) decode "
+        "matched direwolf within print-precision tolerance; %d fixed-point "
+        "lat/lon byte pairs matched direwolf's encoded bytes exactly",
         len(data['course_vectors']),
         len(data['speed_vectors']),
         len(data['fixed_points']),
