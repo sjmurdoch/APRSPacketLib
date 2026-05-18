@@ -28,10 +28,15 @@ Subcommands
     header             Read the JSON and (over)write
                        test/common/aprs_vectors.h. Output is byte-stable.
 
-    validate-aprslib   Decode-only cross-check. Hand each JSON-recorded
-                       byte to aprslib's parser and assert the recovered
-                       values match the JSON's expected fields, at the
-                       tightest spec-justified tolerance.
+    validate-aprslib   Decoder-against-decoder cross-check. Hand each
+                       JSON-recorded byte to aprslib's parser and
+                       assert its decoded values match a Python
+                       re-implementation of the same spec formulas
+                       (decode_lat_base91 / decode_lon_base91 /
+                       decode_speed_kn) to within float-noise
+                       tolerance. Encoder accuracy is *not* in scope
+                       here — that is covered by validate-direwolf's
+                       encode pass and validate-lean.
 
     validate-lean      Decode + encode cross-check. Hand the JSON's
                        fixed-point rows to the Lean validator
@@ -89,6 +94,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -97,6 +103,54 @@ import warnings
 from pathlib import Path
 
 logger = logging.getLogger("gen_aprs_vectors")
+
+
+class _ColorFormatter(logging.Formatter):
+    """Add direction emojis (📥 decode / 📤 encode), PASS/FAIL markers, and
+    ANSI level colours. Colours are only emitted when the handler's stream is
+    a TTY and the NO_COLOR env var is unset (per no-color.org)."""
+
+    _LEVEL_COLOR = {
+        "DEBUG":   "\x1b[2m",      # dim
+        "INFO":    "\x1b[36m",     # cyan
+        "WARNING": "\x1b[33m",     # yellow
+        "ERROR":   "\x1b[1;31m",   # bold red
+    }
+    _RESET = "\x1b[0m"
+    _GREEN = "\x1b[32m"
+    _RED   = "\x1b[31m"
+
+    def __init__(self, color: bool) -> None:
+        super().__init__("%(levelname)s %(message)s")
+        self._color = color
+
+    def format(self, record: logging.LogRecord) -> str:
+        level, _, body = super().format(record).partition(" ")
+        # Direction tag on DEBUG (per-row) lines only — INFO headers and
+        # summaries mention "decode"/"encode" in passing and shouldn't be
+        # flagged as if they were results.
+        if record.levelno == logging.DEBUG:
+            if " decode " in body:
+                body = "📥 " + body
+            elif " encode " in body:
+                body = "📤 " + body
+        # Per-row PASS/FAIL markers from the validate-* subcommands.
+        if self._color:
+            body = body.replace("[PASS]", f"{self._GREEN}✅ PASS{self._RESET}")
+            body = body.replace("[FAIL]", f"{self._RED}❌ FAIL{self._RESET}")
+        else:
+            body = body.replace("[PASS]", "✅ PASS")
+            body = body.replace("[FAIL]", "❌ FAIL")
+        # Summary lines: "OK: ..." (info) and "FAIL: ..." (warning).
+        if body.startswith("OK:"):
+            body = "✅ " + body
+        elif body.startswith("FAIL:"):
+            body = "❌ " + body
+        if self._color:
+            level_out = f"{self._LEVEL_COLOR.get(level, '')}{level}{self._RESET}"
+        else:
+            level_out = level
+        return f"{level_out} {body}"
 
 # aprslib 0.7.2 has unescaped backslashes in its regex literals,
 # tripping SyntaxWarning under Python 3.12+. Filter once at import time.
@@ -146,6 +200,25 @@ T_BYTE_ALT = "Q"
 # halved).
 LAT_FACTOR = 380926
 LON_FACTOR = 190463
+
+
+# Diagnostic toggle: when True, course and speed encoders **and**
+# decode_speed_kmh switch from round-to-nearest to floor (truncation).
+# The default (False) is round-to-nearest -- the spec-silent-but-
+# numerically-correct interpretation -- see encode_course /
+# encode_speed / decode_speed_kmh docstrings for the rationale
+# (direwolf parity, halved worst-case error, no downward bias).
+#
+# Flip to True to cross-check against implementations suspected of
+# truncating: APRS12c §9 itself floors in the lat/lon worked example,
+# some early codecs followed that, and the C++ library under test in
+# this repo currently truncates on the decode side (see
+# `wip/bug_report_decoder_unit_truncation.md`).
+#
+# decode_speed_kn returns the spec-formula float with no rounding, so
+# this flag does not affect it; only the * 1.852 -> int conversion in
+# decode_speed_kmh.
+DEBUG_FLOOR_COURSE_SPEED = False
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +280,28 @@ def encode_lon_base91(lon_deg: float) -> str:
     return base91_pack(int(LON_FACTOR * (180.0 + lon_deg) + 0.5), 4)
 
 
+def decode_lat_base91(encoded: str) -> float:
+    """Pure-formula inverse of encode_lat_base91, with no rounding.
+
+    APRS12c §9 (p. 38) gives the decoder direction as:
+        latitude = 90 - YYYY / 380926
+    where YYYY is the base-91 integer unpacked from the 4 lat bytes.
+    Evaluated in Python double precision, the only error vs. the
+    spec real-valued formula is last-bit float noise — there is no
+    encoder loss in this function because the encoded bytes are
+    treated as authoritative input."""
+    return 90.0 - base91_unpack(encoded) / LAT_FACTOR
+
+
+def decode_lon_base91(encoded: str) -> float:
+    """Pure-formula inverse of encode_lon_base91, with no rounding.
+
+    APRS12c §9 (p. 38):
+        longitude = XXXX / 190463 - 180
+    Same float-noise-only guarantee as decode_lat_base91."""
+    return base91_unpack(encoded) / LON_FACTOR - 180.0
+
+
 def encode_course(course_deg: int) -> str:
     """APRS12c §9 'Course/Speed' (p. 39) gives only the decoder direction:
         'course = c x 4'
@@ -223,8 +318,13 @@ def encode_course(course_deg: int) -> str:
     `lroundf` and direwolf. For course_deg ≥ 0 (the only legal input
     range), `int(x + 0.5)` gives round-half-up, which coincides with
     ties-away on the non-negative reals. The lat/lon encoder above
-    uses the same pattern for the same reason."""
-    return chr(int(course_deg / 4 + 0.5) + 33)
+    uses the same pattern for the same reason.
+
+    DEBUG_FLOOR_COURSE_SPEED flips this to truncation -- see that
+    constant's docstring."""
+    val = course_deg / 4
+    n = int(val) if DEBUG_FLOOR_COURSE_SPEED else int(val + 0.5)
+    return chr(n + 33)
 
 
 def encode_speed(speed_kn: int) -> str:
@@ -234,8 +334,13 @@ def encode_speed(speed_kn: int) -> str:
     encode_course) gives s = round(log_1.08(speed + 1)). Same
     `int(x + 0.5)` ties-away rationale as encode_course; direwolf's
     `s = (int)round(log(speed+1.0)/log(1.08))` in `set_comp_position`
-    uses C99 `round()`, which is also ties-away."""
-    return chr(int(math.log(speed_kn + 1) / math.log(1.08) + 0.5) + 33)
+    uses C99 `round()`, which is also ties-away.
+
+    DEBUG_FLOOR_COURSE_SPEED flips this to truncation -- see that
+    constant's docstring."""
+    val = math.log(speed_kn + 1) / math.log(1.08)
+    n = int(val) if DEBUG_FLOOR_COURSE_SPEED else int(val + 0.5)
+    return chr(n + 33)
 
 
 def encode_altitude(altitude_ft: int) -> tuple[str, str]:
@@ -262,11 +367,23 @@ def decode_speed_kn(s_byte: str) -> float:
 
 
 def decode_speed_kmh(s_byte: str) -> int:
-    """Spec-formula decode rounded the way the C++ decoder rounds.
-    The library returns `int` from a `double` expression, which both C
-    and Python truncate toward zero. Matching that here lets the Unity
-    test assert exact equality with no tolerance."""
-    return int(decode_speed_kn(s_byte) * 1.852)
+    """Spec-formula decode in km/h, rounded to int.
+
+    The APRS spec defines the decode in knots only; the km/h
+    conversion is a presentation-layer concern with no spec-mandated
+    rounding mode. We round-to-nearest (`int(x + 0.5)` for the
+    non-negative speed range) because it halves worst-case error vs.
+    truncation, removes the systematic downward bias truncation
+    introduces (e.g. s='T' decodes to 91.96 km/h: trunc→91 erring by
+    0.96, round→92 erring by 0.04), and matches direwolf's printed
+    integer. See `wip/bug_report_decoder_unit_truncation.md` for the
+    longer write-up.
+
+    DEBUG_FLOOR_COURSE_SPEED flips this to truncation (the historical
+    C++-library behaviour), for cross-checking against
+    truncation-based implementations."""
+    val = decode_speed_kn(s_byte) * 1.852
+    return int(val) if DEBUG_FLOOR_COURSE_SPEED else int(val + 0.5)
 
 
 # ---------------------------------------------------------------------------
@@ -518,27 +635,52 @@ def cmd_validate_aprslib(args: argparse.Namespace) -> int:
     lon_factor = data["_lon_factor"]
     t_byte_cs  = data["_t_byte_cs"]
 
+    logger.info(
+        "validate-aprslib: aprslib's parser decodes each JSON-recorded "
+        "byte; we re-decode the same byte in Python and compare."
+    )
+    logger.info("  Course: ours = cv['course_deg'] from the JSON (with c=0 "
+                "remapped to 360 to match aprslib's 0=unknown/360=due-north "
+                "convention from §10 Mic-E).")
+    logger.info("  Speed:  ours = decode_speed_kn(s_byte) * 1.852 — spec "
+                "formula 1.08^(s-33)-1 kn converted to km/h, as Python float.")
+    logger.info("  Lat:    ours = decode_lat_base91(p['base91_lat']) — spec "
+                "formula 90 - N/380926 applied to the JSON's recorded bytes.")
+    logger.info("  Lon:    ours = decode_lon_base91(p['base91_lon']) — spec "
+                "formula N/190463 - 180 applied to the JSON's recorded bytes.")
+    logger.info("  Compared against aprslib.parse(...)'s 'course' / 'speed' / "
+                "'latitude' / 'longitude' fields. Tolerance is float-noise "
+                "only; encoder accuracy is delegated to validate-direwolf and "
+                "validate-lean.")
+
     # Tolerance rationale (kept here, not at module top, so it sits
     # next to the comparison it governs):
     #
-    # _LAT_TOL_DEG / _LON_TOL_DEG: half a ULP at the encoded-int
-    # level. The decode formula is `90 - N/factor` (or `N/factor - 180`
-    # for lon) where N = round(factor * (offset + x)) (our encoder uses
-    # `int(x + 0.5)`, i.e. round-half-up); under round-to-nearest the
-    # residual is mathematically in [-0.5/factor, 0.5/factor] over
-    # reals. aprslib uses Python floats whose round-off error is many
-    # orders of magnitude smaller than 0.5/factor, so the 1e-12 slack
-    # is plenty for last-bit float noise.
+    # _LAT_TOL_DEG / _LON_TOL_DEG: this validator compares aprslib's
+    # decode of the recorded base-91 bytes against decode_lat_base91 /
+    # decode_lon_base91 -- our Python re-implementation of the same
+    # spec formula. Both evaluate `90 - N/factor` (or `N/factor - 180`
+    # for lon) in Python double precision from the same integer N, so
+    # the residual is purely last-bit float noise (~1e-14 worst case
+    # for values up to ±90/±180); 1e-12 gives ~100× margin and is a
+    # clean round number. Encoder loss (up to 0.5/factor) is *not*
+    # in this bound -- it's covered by validate-direwolf's encode
+    # pass and by validate-lean.
     #
-    # _SPEED_TOL_KMH: the spec speed decoder formula is `1.08^(s-33) - 1`
-    # knots (§9 p. 39); we convert to km/h via the standard 1.852
-    # factor (a unit conversion, not a spec formula). aprslib evaluates
-    # the same closed-form. Only last-bit float noise should appear --
-    # 1e-9 km/h is ~10⁵× larger than that and ~10⁹× smaller than any
-    # meaningful km/h value.
-    _LAT_TOL_DEG   = 0.5 / lat_factor + 1e-12
-    _LON_TOL_DEG   = 0.5 / lon_factor + 1e-12
-    _SPEED_TOL_KMH = 1e-9
+    # _SPEED_TOL_KMH: same pattern -- the spec speed decoder formula
+    # is `1.08^(s-33) - 1` knots (§9 p. 39), converted to km/h via
+    # the standard 1.852 factor. We compare aprslib against
+    # decode_speed_kn(s) * 1.852, both Python float. The chain is
+    # four ops deep (one being a transcendental `pow` worth ~1 ULP),
+    # so worst-case float noise is ~few ULPs of the max speed value
+    # ≈ 1e-13. 1e-12 gives ~10× margin and matches the lat/lon bound
+    # so there's a single "float noise" tolerance across the
+    # validator. Observed residuals are 0.0 (aprslib uses identical
+    # operations in identical order); the bound is for defensiveness
+    # against future intermediate-precision changes on either side.
+    _LAT_TOL_DEG   = 1e-12
+    _LON_TOL_DEG   = 1e-12
+    _SPEED_TOL_KMH = 1e-12
 
     failures: list[str] = []
 
@@ -569,7 +711,7 @@ def cmd_validate_aprslib(args: argparse.Namespace) -> int:
             got_course = parsed.get("course")
             course_ok = got_course == expected_course
             logger.debug(
-                "aprslib course byte %r: ours=%s°, aprslib=%s° [%s]",
+                "aprslib decode course byte %r: ours=%s°, aprslib=%s° [%s]",
                 c_byte, expected_course, got_course,
                 "PASS" if course_ok else "FAIL",
             )
@@ -586,7 +728,7 @@ def cmd_validate_aprslib(args: argparse.Namespace) -> int:
                 "n/a" if got_speed is None else f"{got_speed - spec_kmh:+.3e}"
             )
             logger.debug(
-                "aprslib speed byte %r: ours=%.6f km/h, aprslib=%s km/h, "
+                "aprslib decode speed byte %r: ours=%.6f km/h, aprslib=%s km/h, "
                 "residual=%s, tol=%.1e [%s]",
                 s_byte, spec_kmh, got_speed, speed_residual, _SPEED_TOL_KMH,
                 "PASS" if speed_ok else "FAIL",
@@ -598,8 +740,12 @@ def cmd_validate_aprslib(args: argparse.Namespace) -> int:
                     f"(tolerance {_SPEED_TOL_KMH:.1e})"
                 )
 
-    # Fixed points: lat/lon decoded by aprslib from the recorded base-91
-    # bytes; checked against the JSON's expected decimal-degree value.
+    # Fixed points: aprslib's decode of the recorded base-91 bytes is
+    # compared against decode_lat_base91 / decode_lon_base91 -- our
+    # pure-formula re-implementation of the spec decoder -- so the
+    # residual is float-noise only. The original p["lat_deg"] / lon_deg
+    # input is *not* used here; encoder loss is a separate concern
+    # covered by validate-direwolf and validate-lean.
     for p in data["fixed_points"]:
         info = (
             "=/" + p["base91_lat"] + p["base91_lon"]
@@ -613,14 +759,14 @@ def cmd_validate_aprslib(args: argparse.Namespace) -> int:
             continue
 
         for field, expected, tol in (
-            ("latitude",  p["lat_deg"], _LAT_TOL_DEG),
-            ("longitude", p["lon_deg"], _LON_TOL_DEG),
+            ("latitude",  decode_lat_base91(p["base91_lat"]),  _LAT_TOL_DEG),
+            ("longitude", decode_lon_base91(p["base91_lon"]), _LON_TOL_DEG),
         ):
             got = parsed.get(field)
             ok = got is not None and abs(got - expected) < tol
             residual = "n/a" if got is None else f"{got - expected:+.3e}"
             logger.debug(
-                "aprslib %s %s: ours=%s, aprslib=%s, residual=%s, "
+                "aprslib decode %s %s: ours=%s, aprslib=%s, residual=%s, "
                 "tol=%.3e [%s]",
                 p["name"], field, expected, got, residual, tol,
                 "PASS" if ok else "FAIL",
@@ -639,7 +785,8 @@ def cmd_validate_aprslib(args: argparse.Namespace) -> int:
             logger.warning("  - %s", f)
         return 1
     logger.info(
-        "OK: %d course × %d speed pairs and %d fixed points round-trip through aprslib",
+        "OK: %d course × %d speed pairs and %d fixed points decoded by aprslib "
+        "match our spec-formula re-implementation within float noise",
         len(data['course_vectors']),
         len(data['speed_vectors']),
         len(data['fixed_points']),
@@ -654,6 +801,22 @@ def cmd_validate_aprslib(args: argparse.Namespace) -> int:
 def cmd_validate_lean(args: argparse.Namespace) -> int:
     data = json.loads(args.json.read_text())
     fps = data["fixed_points"]
+
+    logger.info(
+        "validate-lean: encode + decode against the formally-proven Lean "
+        "implementation in tools/ValidatedTestVectors/."
+    )
+    logger.info("Each fixed-point row sent to Lean carries:")
+    logger.info("  name        — diagnostic label.")
+    logger.info("  lat_deg / lon_deg — the encoder INPUT (FIXED_POINTS).")
+    logger.info("  base91_lat / base91_lon — our spec-formula encoded bytes.")
+    logger.info(
+        "Lean re-runs encodeLat/encodeLon (expected byte-exact agreement with "
+        "ours) and decodeLat/decodeLon on our bytes (expected within the "
+        "formally-proven 1/factor bound of the input). Per-row pass/fail and "
+        "residuals are printed by the Lean program itself; the Python wrapper "
+        "passes that output through verbatim."
+    )
 
     # Pipe-delimited input: name | lat_deg | lon_deg | base91_lat | base91_lon
     # `|` (ASCII 124) and `\n` (ASCII 10) lie outside the base-91 alphabet
@@ -906,6 +1069,42 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
     t_byte_alt = data["_t_byte_alt"]
     cwd        = _find_direwolf_data_dir()
 
+    logger.info(
+        "validate-direwolf: two passes through direwolf — decode "
+        "(decode_aprs(1)) and encode (direwolf PBEACON COMPRESS=1)."
+    )
+    logger.info("Decode pass — we hand direwolf each JSON-recorded byte and "
+                "read its parsed values back from its text output:")
+    logger.info("  Course: ours = cv['course_deg'] from the JSON. Compared "
+                "against decode_aprs's 'course=' field (exact integer match).")
+    logger.info("  Speed:  ours = decode_speed_kn(s_byte) * 1.852 — spec "
+                "float in km/h. Compared against decode_aprs's printed km/h "
+                "integer to within ±0.5 (half-LSB of direwolf's rounding).")
+    logger.info("  Lat:    ours = p['lat_deg'] — the encoder INPUT from "
+                "FIXED_POINTS. Compared against decode_aprs's reconstructed "
+                "decimal degrees; tolerance absorbs encoder half-ULP plus "
+                "decode_aprs's DD MM.mmmm print truncation.")
+    logger.info("  Lon:    ours = p['lon_deg'] — same shape as lat.")
+    logger.info("  Alt:    ours = p['altitude_m'] — encoder INPUT. Compared "
+                "against decode_aprs's printed metre integer; tolerance "
+                "absorbs log_1.002 encode quantization + direwolf's int "
+                "rounding.")
+    logger.info(
+        "Encode pass — we feed FIXED_POINTS lat/lon as PBEACON SOURCE/LAT/LONG "
+        "to direwolf and capture the base91 bytes it emits on the air "
+        "(direwolf's PBEACON is stationary, so the cs slot is the 'no-data' "
+        "space and altitude is written as /A=NNNNNN — only lat/lon bytes "
+        "are exercised):"
+    )
+    logger.info("  Bytes:  ours = p['base91_lat']/p['base91_lon'] — our "
+                "spec-formula encoded bytes. Compared byte-for-byte against "
+                "direwolf's emitted bytes (exact equality is expected since "
+                "both round to nearest).")
+    logger.info("  Round-trip: ours = p['lat_deg']/p['lon_deg'] — the encoder "
+                "INPUT. Direwolf's emitted bytes are decoded back through our "
+                "base91_unpack + spec formula and compared to that input "
+                "within encoder half-ULP.")
+
     # Tolerance rationale (kept here, not at module top, so it sits
     # next to the comparison it governs):
     #
@@ -917,13 +1116,11 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
     # half-ULP bound plus a 1e-6 slack covering the print truncation
     # plus float noise.
     #
-    # _SPEED_TOL_KMH: direwolf prints km/h as a rounded integer (the
-    # C library truncates; see decode_speed_kmh docstring). Comparing
-    # the direwolf integer against the closed-form spec float must
-    # therefore tolerate the half-LSB rounding gap. ±1 km/h is the
-    # bound; anything tighter would fail on every speed whose km/h
-    # value is within 0.5 of an integer (e.g. 'T' at 91.90 km/h:
-    # truncates to 91, rounds to 92).
+    # _SPEED_TOL_KMH: direwolf prints km/h as a rounded integer.
+    # Comparing direwolf's integer against the closed-form spec float
+    # therefore has a worst-case gap of 0.5 km/h (half-LSB from
+    # rounding); the +1e-9 sliver covers float noise so the bound is
+    # not literally 0.5 in edge cases.
     #
     # _alt_tol_m(m): encoder is `int(log_1.002(ft))` -- one ULP in
     # log space means ft is recovered within a multiplicative factor
@@ -934,7 +1131,7 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
     # cases at ±1 m.
     _LAT_TOL_DEG   = 0.5 / lat_factor + 1e-6
     _LON_TOL_DEG   = 0.5 / lon_factor + 1e-6
-    _SPEED_TOL_KMH = 1
+    _SPEED_TOL_KMH = 0.5 + 1e-9
     def _alt_tol_m(m: int) -> int:
         return math.ceil(m * 0.002) + 1
 
@@ -960,7 +1157,7 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
             got_course = got.get("course")
             course_ok = got_course == cv["course_deg"]
             logger.debug(
-                "direwolf course byte %r: ours=%s°, direwolf=%s° [%s]",
+                "direwolf decode course byte %r: ours=%s°, direwolf=%s° [%s]",
                 c_byte, cv["course_deg"], got_course,
                 "PASS" if course_ok else "FAIL",
             )
@@ -970,16 +1167,17 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
                     f"direwolf got {got_course}°"
                 )
 
-            # Compare against the spec float; the JSON's
-            # `speed_kmh_decoded` is the *truncating* C-library value
-            # and disagrees with direwolf's rounded print by ~1 km/h
-            # whenever the float lies within 0.5 of an integer.
+            # Compare direwolf's rounded integer against the spec
+            # float (not the JSON's already-rounded
+            # speed_kmh_decoded) so the ±0.5 km/h half-LSB bound
+            # below applies cleanly and the validator stays
+            # independent of decode_speed_kmh's rounding mode.
             spec_kmh = decode_speed_kn(s_byte) * 1.852
             got_kmh = got.get("speed_kmh")
             speed_ok = got_kmh is not None and abs(got_kmh - spec_kmh) <= _SPEED_TOL_KMH
             speed_residual = "n/a" if got_kmh is None else f"{got_kmh - spec_kmh:+.3f}"
             logger.debug(
-                "direwolf speed byte %r: ours=%.3f km/h, direwolf=%s km/h, "
+                "direwolf decode speed byte %r: ours=%.3f km/h, direwolf=%s km/h, "
                 "residual=%s, tol=±%s km/h [%s]",
                 s_byte, spec_kmh, got_kmh, speed_residual, _SPEED_TOL_KMH,
                 "PASS" if speed_ok else "FAIL",
@@ -1014,7 +1212,7 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
             ok = v is not None and abs(v - expected) <= tol
             residual = "n/a" if v is None else f"{v - expected:+.3e}"
             logger.debug(
-                "direwolf %s %s: ours=%s, direwolf=%s, residual=%s, "
+                "direwolf decode %s %s: ours=%s, direwolf=%s, residual=%s, "
                 "tol=%.3e [%s]",
                 p["name"], field, expected, v, residual, tol,
                 "PASS" if ok else "FAIL",
@@ -1043,7 +1241,7 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
         alt_ok = v is not None and abs(v - p["altitude_m"]) <= alt_tol
         alt_residual = "n/a" if v is None else f"{v - p['altitude_m']:+d}"
         logger.debug(
-            "direwolf %s altitude_m: ours=%d, direwolf=%s, residual=%s m, "
+            "direwolf decode %s altitude_m: ours=%d, direwolf=%s, residual=%s m, "
             "tol=±%d m [%s]",
             p["name"], p["altitude_m"], v, alt_residual, alt_tol,
             "PASS" if alt_ok else "FAIL",
@@ -1227,11 +1425,10 @@ def main(argv: list[str] | None = None) -> int:
     # bump only our own logger to the requested level. Levels are
     # filtered at the originating logger before propagation, so our
     # DEBUG/INFO records still reach the root handler.
-    logging.basicConfig(
-        level=logging.WARNING,
-        format="%(levelname)s %(message)s",
-        stream=sys.stderr,
-    )
+    handler = logging.StreamHandler(sys.stderr)
+    use_color = sys.stderr.isatty() and "NO_COLOR" not in os.environ
+    handler.setFormatter(_ColorFormatter(use_color))
+    logging.basicConfig(level=logging.WARNING, handlers=[handler])
     logger.setLevel(level)
     return args.func(args)
 

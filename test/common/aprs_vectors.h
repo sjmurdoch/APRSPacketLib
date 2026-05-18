@@ -44,8 +44,8 @@ static const SpeedVector kSpeedVectors[] = {
     { '!'   ,   0 },
     { 'N'   ,  57 },
     { 'P'   ,  67 },
-    { 'T'   ,  91 },
-    { ']'   , 185 },
+    { 'T'   ,  92 },
+    { ']'   , 186 },
 };
 
 static const Base91FixedPoint kBase91FixedPoints[] = {

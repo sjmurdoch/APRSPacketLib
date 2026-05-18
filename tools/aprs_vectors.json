@@ -17,8 +17,8 @@
     {"speed_kn_input": 0, "encoded": "!", "speed_kmh_decoded": 0},
     {"speed_kn_input": 30, "encoded": "N", "speed_kmh_decoded": 57},
     {"speed_kn_input": 36, "encoded": "P", "speed_kmh_decoded": 67},
-    {"speed_kn_input": 50, "encoded": "T", "speed_kmh_decoded": 91},
-    {"speed_kn_input": 99, "encoded": "]", "speed_kmh_decoded": 185}
+    {"speed_kn_input": 50, "encoded": "T", "speed_kmh_decoded": 92},
+    {"speed_kn_input": 99, "encoded": "]", "speed_kmh_decoded": 186}
   ],
   "fixed_points": [
     {"name": "Munich", "lat_deg": 48.138630, "lon_deg": 11.573410, "course_deg": 90, "speed_kn": 30, "altitude_m": 525, "altitude_ft": 1722, "base91_lat": "6/Y`", "base91_lon": "QG2.", "base91_c": "8", "base91_s": "N", "base91_alt_c": "I", "base91_alt_s": "z"},
