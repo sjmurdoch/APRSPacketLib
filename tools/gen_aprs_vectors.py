@@ -190,6 +190,20 @@ DEFAULT_LEAN_DIR = REPO_ROOT / "tools" / "ValidatedTestVectors"
 COURSE_CASES_DEG = [0, 88, 100, 180, 200, 356]
 SPEED_CASES_KN   = [0, 30, 36, 50, 99]
 
+# Off-grid course inputs: these are NOT multiples of 4 and so don't
+# fit COURSE_CASES_DEG's `(byte, course_deg)` shape (the byte's
+# decoded value differs from the input). Each entry exercises a
+# specific round-half-up behaviour the L4 course-encode bug is
+# symptomatic of:
+#   89   — control; both round-half-up and truncation map to byte '7'
+#          (88°), so this should *not* expose any divergence.
+#   91   — lower-grid divergence; round-half-up gives '8' (92°), the
+#          C++ truncation in the L4 bug gives '7' (88°).
+#   359  — explicit L4 round-trip failing case; round-half-up gives
+#          '{' (360°), C++ truncation gives 'z' (356°).
+# See wip/bug_report_l4_encode_course.md.
+COURSE_ROUNDTRIP_CASES_DEG = [89, 91, 359]
+
 # (name, lat_deg, lon_deg, course_deg, speed_kn, altitude_m).
 FIXED_POINTS = [
     ("Munich",     48.138630,   11.573410,   90,  30,  525),
@@ -312,28 +326,36 @@ def decode_lon_base91(encoded: str) -> float:
 
 
 def encode_course(course_deg: int) -> str:
-    """APRS12c §9 'Course/Speed' (p. 39) gives only the decoder direction:
+    """APRS12c §9 'Course/Speed' (p. 38–39) gives only the decoder direction:
         'course = c x 4'
-    with c constrained to numeric 0..89 (encoded course ∈ {0,4,…,356}).
-    The spec does not write an encoder formula or state a rounding mode
-    for the inversion; we round-to-nearest because it matches direwolf
-    and halves the worst-case encode error vs. truncation. Direwolf's
-    `(course + 2) / 4` integer expression rounds ties away from zero
-    (for the non-negative course range that compressed positions cover);
-    C's `lroundf` does the same.
+    with c constrained to numeric 0..89 — 'If the ASCII code for c is
+    in the range ! to z inclusive — corresponding to numeric values in
+    the range 0–89 decimal'. Encoded course is therefore in
+    {0, 4, …, 356}; 360° has no defined encoding and `' '` (space) is
+    a separate 'no data' sentinel.
 
-    `int(x + 0.5)` rather than Python's `round()`: Python's `round` is
-    banker's (ties to even); we want ties-away-from-zero to match C's
-    `lroundf` and direwolf. For course_deg ≥ 0 (the only legal input
-    range), `int(x + 0.5)` gives round-half-up, which coincides with
-    ties-away on the non-negative reals. The lat/lon encoder above
-    uses the same pattern for the same reason.
+    The spec does not write an encoder formula or state a rounding
+    mode for the inversion; we round-to-nearest because it matches
+    direwolf and halves the worst-case encode error vs. truncation.
+    Inputs ≥ 358° round to c = 90 under round-half-up, which is *out
+    of spec*: both aprslib and direwolf reject byte '{' (c = 90) on
+    decode. Fold c = 90 back to c = 0 via `% 90` so input 359° emits
+    '!' (decoded 0°, circular delta 1° from input) — the nearest
+    representable grid point under the spec's degree-circle topology
+    (360° ≡ 0°).
 
-    DEBUG_FLOOR_COURSE_SPEED flips this to truncation -- see that
-    constant's docstring."""
+    `int(x + 0.5)` rather than Python's `round()`: Python's `round`
+    is banker's (ties to even); we want ties-away-from-zero to match
+    C's `lroundf` and direwolf. For course_deg ≥ 0 (the only legal
+    input range), `int(x + 0.5)` gives round-half-up, which coincides
+    with ties-away on the non-negative reals. The lat/lon encoder
+    above uses the same pattern for the same reason.
+
+    DEBUG_FLOOR_COURSE_SPEED flips the rounding step to truncation
+    (see that constant's docstring); the % 90 wrap still applies."""
     val = course_deg / 4
     n = int(val) if DEBUG_FLOOR_COURSE_SPEED else int(val + 0.5)
-    return chr(n + 33)
+    return chr((n % 90) + 33)
 
 
 def encode_speed(speed_kn: int) -> str:
@@ -421,12 +443,16 @@ def decode_speed_kmh(s_byte: str) -> int:
 def _build_records():
     """Compute every byte from the spec formulas and the source-of-truth
     lists at the top of this file. Returns (course_vecs, speed_vecs,
-    fixed_points) where each row is a tuple/dict ready for
-    `_render_json`."""
+    course_roundtrip_vecs, fixed_points) where each row is a
+    tuple/dict ready for `_render_json`."""
     course_vecs = [(encode_course(c), c) for c in COURSE_CASES_DEG]
     speed_vecs = [
         (encode_speed(s), s, decode_speed_kmh(encode_speed(s)))
         for s in SPEED_CASES_KN
+    ]
+    course_roundtrip_vecs = [
+        (c_in, encode_course(c_in), decode_course(encode_course(c_in)))
+        for c_in in COURSE_ROUNDTRIP_CASES_DEG
     ]
     fixed_points = []
     for name, lat, lon, course, speed, alt_m in FIXED_POINTS:
@@ -448,10 +474,12 @@ def _build_records():
             "base91_alt_c": alt_c,
             "base91_alt_s": alt_s,
         })
-    return course_vecs, speed_vecs, fixed_points
+    return course_vecs, speed_vecs, course_roundtrip_vecs, fixed_points
 
 
-def _self_test_records(course_vecs, speed_vecs, fixed_points) -> None:
+def _self_test_records(
+    course_vecs, speed_vecs, course_roundtrip_vecs, fixed_points,
+) -> None:
     """Run Python encode/decode self-tests on every row before JSON is
     written. Failure raises RuntimeError naming the offending row.
 
@@ -534,6 +562,38 @@ def _self_test_records(course_vecs, speed_vecs, fixed_points) -> None:
                 f"{decode_course(byte)}, expected {c_deg}"
             )
 
+    # Off-grid course round-trips: each input rounds to the nearest
+    # 4°-grid point under round-half-up, so encode→decode produces a
+    # value within 2° of the input in *circular* (mod 360) distance,
+    # not linear distance. Inputs near 360° wrap to 0° via encode_
+    # course's % 90 step, so linear |c_out - c_in| ≈ 359° while the
+    # circular delta is 1°. The recorded `decoded_deg` is the byte's
+    # spec-formula decode.
+    for c_in, byte, c_out in course_roundtrip_vecs:
+        linear_delta = abs(c_out - c_in)
+        circular_delta = min(linear_delta, 360 - linear_delta)
+        logger.debug(
+            "self-test course (roundtrip): input=%d° → byte=%r → "
+            "decoded=%d°, circular delta=%d°",
+            c_in, byte, c_out, circular_delta,
+        )
+        if encode_course(c_in) != byte:
+            raise RuntimeError(
+                f"self-test course (roundtrip): encode_course({c_in}) "
+                f"= {encode_course(c_in)!r}, expected {byte!r}"
+            )
+        if decode_course(byte) != c_out:
+            raise RuntimeError(
+                f"self-test course (roundtrip): decode_course({byte!r}) "
+                f"= {decode_course(byte)}, expected {c_out}"
+            )
+        if circular_delta > 2:
+            raise RuntimeError(
+                f"self-test course (roundtrip): input {c_in}° → byte "
+                f"{byte!r} → decoded {c_out}° (circular delta "
+                f"{circular_delta}°) exceeds 2° half-LSB bound"
+            )
+
     # Speed: round-to-nearest encoder in log_1.08 space, so the
     # decoded knots sit within a multiplicative √1.08 of (v_in + 1).
     # Symmetric bound: |v_out − v_in| ≤ (√1.08 − 1)(v_in + 1) + ε.
@@ -581,10 +641,65 @@ def _self_test_records(course_vecs, speed_vecs, fixed_points) -> None:
                 f"(residual {alt_residual:+.3f}, bound ±{bound:.3f})"
             )
 
+    # Fixed-point course/speed: same shape as the cartesian-product
+    # course_vecs / speed_vecs checks above, but applied to the c/s
+    # bytes a fixed point carries (which can be off-grid — Munich's
+    # course=90 is the canonical example, rounding to byte '8' which
+    # decodes to 92°, not 90°). Catches encoder regressions on
+    # round-half-up inputs in the fixed-point set itself.
+    for fp in fixed_points:
+        c_byte = fp["base91_c"]
+        c_in = fp["course_deg"]
+        if encode_course(c_in) != c_byte:
+            raise RuntimeError(
+                f"self-test course (fixed): {fp['name']} "
+                f"encode_course({c_in}) = {encode_course(c_in)!r}, "
+                f"expected {c_byte!r}"
+            )
+        c_out = decode_course(c_byte)
+        c_bound = 2 + 1e-9    # half a 4°-ULP, ties round away from zero
+        c_residual = c_out - c_in
+        logger.debug(
+            "self-test course (fixed) %s: input=%d° → byte=%r → "
+            "decoded=%d°, residual=%+d°, bound=±2°",
+            fp["name"], c_in, c_byte, c_out, c_residual,
+        )
+        if abs(c_residual) > c_bound:
+            raise RuntimeError(
+                f"self-test course (fixed): {fp['name']} input {c_in}° "
+                f"→ byte {c_byte!r} → decoded {c_out}° "
+                f"(residual {c_residual:+d}°, bound ±2°)"
+            )
+
+        s_byte = fp["base91_s"]
+        v_in_kn = fp["speed_kn"]
+        if encode_speed(v_in_kn) != s_byte:
+            raise RuntimeError(
+                f"self-test speed (fixed): {fp['name']} "
+                f"encode_speed({v_in_kn}) = {encode_speed(v_in_kn)!r}, "
+                f"expected {s_byte!r}"
+            )
+        v_out_kn = decode_speed_kn(s_byte)
+        s_bound = HALF_ULP_FACTOR * (v_in_kn + 1) + 1e-9
+        s_residual = v_out_kn - v_in_kn
+        logger.debug(
+            "self-test speed (fixed) %s: input=%d kn → byte=%r → "
+            "decoded=%.6f kn, residual=%+.3e, bound=±%.3e",
+            fp["name"], v_in_kn, s_byte, v_out_kn, s_residual, s_bound,
+        )
+        if abs(s_residual) > s_bound:
+            raise RuntimeError(
+                f"self-test speed (fixed): {fp['name']} input {v_in_kn} kn "
+                f"→ byte {s_byte!r} → decoded {v_out_kn:.6f} kn "
+                f"(residual {s_residual:+.3e}, bound ±{s_bound:.3e})"
+            )
+
     logger.info(
-        "self-test: %d fixed points (lat/lon/alt) + %d courses + %d speeds "
-        "round-trip within spec-quantization bounds",
+        "self-test: %d fixed points (lat/lon/alt/c/s) + %d courses + "
+        "%d speeds + %d off-grid course round-trips within "
+        "spec-quantization bounds",
         len(fixed_points), len(course_vecs), len(speed_vecs),
+        len(course_roundtrip_vecs),
     )
 
 
@@ -612,7 +727,9 @@ def _fmt_coord(v: float) -> str:
     return f"{v:.6f}"
 
 
-def _render_json(course_vecs, speed_vecs, fixed_points) -> str:
+def _render_json(
+    course_vecs, speed_vecs, course_roundtrip_vecs, fixed_points,
+) -> str:
     """Hand-format the JSON. Templated rather than json.dumps()'d so
     that float formatting and key ordering are pinned by source code,
     not by the json module's internal heuristics. Produces stable bytes
@@ -645,6 +762,21 @@ def _render_json(course_vecs, speed_vecs, fixed_points) -> str:
         )
     L.append('  ],')
 
+    # Off-grid course inputs whose encoded byte's decoded value
+    # differs from the input. Distinct from course_vectors so the
+    # (byte, course_deg) shape there stays a clean identity.
+    L.append('  "course_roundtrip_vectors": [')
+    for i, (input_deg, encoded, decoded_deg) in enumerate(
+        course_roundtrip_vecs
+    ):
+        sep = "," if i < len(course_roundtrip_vecs) - 1 else ""
+        L.append(
+            f'    {{"input_deg": {input_deg}, '
+            f'"encoded": {_json_string(encoded)}, '
+            f'"decoded_deg": {decoded_deg}}}{sep}'
+        )
+    L.append('  ],')
+
     L.append('  "fixed_points": [')
     for i, p in enumerate(fixed_points):
         sep = "," if i < len(fixed_points) - 1 else ""
@@ -671,9 +803,15 @@ def _render_json(course_vecs, speed_vecs, fixed_points) -> str:
 
 
 def cmd_generate(args: argparse.Namespace) -> int:
-    course_vecs, speed_vecs, fixed_points = _build_records()
-    _self_test_records(course_vecs, speed_vecs, fixed_points)
-    args.json.write_text(_render_json(course_vecs, speed_vecs, fixed_points))
+    course_vecs, speed_vecs, course_roundtrip_vecs, fixed_points = (
+        _build_records()
+    )
+    _self_test_records(
+        course_vecs, speed_vecs, course_roundtrip_vecs, fixed_points,
+    )
+    args.json.write_text(_render_json(
+        course_vecs, speed_vecs, course_roundtrip_vecs, fixed_points,
+    ))
     logger.info("wrote %s", args.json)
     return 0
 
@@ -912,6 +1050,40 @@ def cmd_validate_aprslib(args: argparse.Namespace) -> int:
                     f"(tolerance {_SPEED_TOL_KMH:.1e})"
                 )
 
+    # Off-grid course round-trips: each row carries (input_deg,
+    # encoded byte, decoded_deg). aprslib's decode of the byte is
+    # compared against decoded_deg (= decode_course(byte) with
+    # aprslib's 0 → 360 remap applied). Catches whether aprslib
+    # agrees with our Python re-decode about what each off-grid
+    # input rounds to under round-half-up — i.e. third-party
+    # evidence for wip/bug_report_l4_encode_course.md.
+    for rt in data["course_roundtrip_vectors"]:
+        c_byte = rt["encoded"]
+        spec_decoded = rt["decoded_deg"]
+        expected_course = 360 if spec_decoded == 0 else spec_decoded
+        packet = f"TEST>APRS:=/<<<<<<<<>{c_byte}!{t_byte_cs}"
+        try:
+            parsed = aprslib.parse(packet)
+        except Exception as exc:  # pragma: no cover - diagnostic only
+            failures.append(
+                f"course roundtrip input={rt['input_deg']}° byte={c_byte!r}:"
+                f" aprslib raised {exc!r}"
+            )
+            continue
+        got_course = parsed.get("course")
+        ok = got_course == expected_course
+        logger.debug(
+            "aprslib decode course (roundtrip) input=%d° byte=%r: "
+            "ours=%s°, aprslib=%s° [%s]",
+            rt["input_deg"], c_byte, expected_course, got_course,
+            "PASS" if ok else "FAIL",
+        )
+        if not ok:
+            failures.append(
+                f"course roundtrip input={rt['input_deg']}° byte={c_byte!r}:"
+                f" expected {expected_course}°, aprslib got {got_course}°"
+            )
+
     # Fixed points: aprslib's decode of the recorded base-91 bytes is
     # compared against decode_lat_base91 / decode_lon_base91 -- our
     # pure-formula re-implementation of the spec decoder -- so the
@@ -950,6 +1122,50 @@ def cmd_validate_aprslib(args: argparse.Namespace) -> int:
                     f"aprslib decoded {got} (residual {residual_val!r}, "
                     f"tolerance {tol:.3e} deg)"
                 )
+
+        # Fixed-point course/speed: the c/s bytes a fixed point
+        # carries may be off-grid (Munich's course=90 → '8' decoding
+        # to 92° is the canonical example). Compare aprslib's parsed
+        # values against decode_course(c) / decode_speed_kn(s)*1.852
+        # so any cross-impl disagreement on what the fixed-point
+        # bytes mean surfaces here too — not just in the cartesian
+        # course_vectors × speed_vectors loop above.
+        spec_fp_course = decode_course(p["base91_c"])
+        expected_fp_course = 360 if spec_fp_course == 0 else spec_fp_course
+        got_fp_course = parsed.get("course")
+        fp_course_ok = got_fp_course == expected_fp_course
+        logger.debug(
+            "aprslib decode %s course byte %r: ours=%s°, aprslib=%s° [%s]",
+            p["name"], p["base91_c"], expected_fp_course, got_fp_course,
+            "PASS" if fp_course_ok else "FAIL",
+        )
+        if not fp_course_ok:
+            failures.append(
+                f"{p['name']}: course byte {p['base91_c']!r} expected "
+                f"{expected_fp_course}°, aprslib got {got_fp_course}°"
+            )
+
+        spec_fp_kmh = decode_speed_kn(p["base91_s"]) * 1.852
+        got_fp_speed = parsed.get("speed")
+        fp_speed_ok = (got_fp_speed is not None
+                       and abs(got_fp_speed - spec_fp_kmh) <= _SPEED_TOL_KMH)
+        fp_speed_residual = (
+            "n/a" if got_fp_speed is None
+            else f"{got_fp_speed - spec_fp_kmh:+.3e}"
+        )
+        logger.debug(
+            "aprslib decode %s speed byte %r: ours=%.6f km/h, "
+            "aprslib=%s km/h, residual=%s, tol=%.1e [%s]",
+            p["name"], p["base91_s"], spec_fp_kmh, got_fp_speed,
+            fp_speed_residual, _SPEED_TOL_KMH,
+            "PASS" if fp_speed_ok else "FAIL",
+        )
+        if not fp_speed_ok:
+            failures.append(
+                f"{p['name']}: speed byte {p['base91_s']!r} expected "
+                f"{spec_fp_kmh} km/h, aprslib got {got_fp_speed} km/h "
+                f"(tolerance {_SPEED_TOL_KMH:.1e})"
+            )
 
     if failures:
         logger.warning("FAIL: aprslib disagrees with JSON-recorded vectors:")
@@ -1370,6 +1586,38 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
                     f"(tolerance ±{_SPEED_TOL_KMH} km/h)"
                 )
 
+    # Off-grid course round-trips: same shape as the aprslib block —
+    # confirm direwolf agrees with our Python re-decode on what each
+    # off-grid input rounds to under round-half-up. Pair the c-byte
+    # with the speed-no-data sentinel '!' so direwolf prints the
+    # course unambiguously. Provides direwolf-side evidence for
+    # wip/bug_report_l4_encode_course.md.
+    for rt in data["course_roundtrip_vectors"]:
+        c_byte = rt["encoded"]
+        spec_decoded = rt["decoded_deg"]
+        packet = f"TEST>APRS:=/<<<<<<<<>{c_byte}!{t_byte_cs}"
+        try:
+            got = _decode_via_direwolf(packet, exe, cwd)
+        except RuntimeError as exc:
+            failures.append(
+                f"course roundtrip input={rt['input_deg']}° byte={c_byte!r}:"
+                f" {exc}"
+            )
+            continue
+        got_course = got.get("course")
+        ok = got_course == spec_decoded
+        logger.debug(
+            "direwolf decode course (roundtrip) input=%d° byte=%r: "
+            "ours=%s°, direwolf=%s° [%s]",
+            rt["input_deg"], c_byte, spec_decoded, got_course,
+            "PASS" if ok else "FAIL",
+        )
+        if not ok:
+            failures.append(
+                f"course roundtrip input={rt['input_deg']}° byte={c_byte!r}:"
+                f" expected {spec_decoded}°, direwolf got {got_course}°"
+            )
+
     # Fixed points: lat/lon from the recorded base-91 bytes (cs slot
     # carries course/speed for one packet, altitude for the other so
     # we exercise both T-byte branches).
@@ -1405,6 +1653,49 @@ def cmd_validate_direwolf(args: argparse.Namespace) -> int:
                     f"direwolf got {v} (residual {residual_val!r}, "
                     f"tolerance {tol:.3e} deg)"
                 )
+
+        # Fixed-point course/speed: same shape as the cartesian
+        # product loop above, but applied to the c/s bytes a fixed
+        # point carries. Munich's c=90 → '8' decoding to 92° is the
+        # canonical off-grid case the L4 course-encode bug
+        # (wip/bug_report_l4_encode_course.md) is about; without this
+        # block, direwolf never sees the fixed-point c/s bytes for
+        # comparison.
+        spec_fp_course = decode_course(p["base91_c"])
+        got_fp_course = got.get("course")
+        fp_course_ok = got_fp_course == spec_fp_course
+        logger.debug(
+            "direwolf decode %s course byte %r: ours=%s°, direwolf=%s° [%s]",
+            p["name"], p["base91_c"], spec_fp_course, got_fp_course,
+            "PASS" if fp_course_ok else "FAIL",
+        )
+        if not fp_course_ok:
+            failures.append(
+                f"{p['name']}: course byte {p['base91_c']!r} expected "
+                f"{spec_fp_course}°, direwolf got {got_fp_course}°"
+            )
+
+        spec_fp_kmh = decode_speed_kn(p["base91_s"]) * 1.852
+        got_fp_kmh = got.get("speed_kmh")
+        fp_speed_ok = (got_fp_kmh is not None
+                       and abs(got_fp_kmh - spec_fp_kmh) <= _SPEED_TOL_KMH)
+        fp_speed_residual = (
+            "n/a" if got_fp_kmh is None
+            else f"{got_fp_kmh - spec_fp_kmh:+.3f}"
+        )
+        logger.debug(
+            "direwolf decode %s speed byte %r: ours=%.3f km/h, "
+            "direwolf=%s km/h, residual=%s, tol=±%s km/h [%s]",
+            p["name"], p["base91_s"], spec_fp_kmh, got_fp_kmh,
+            fp_speed_residual, _SPEED_TOL_KMH,
+            "PASS" if fp_speed_ok else "FAIL",
+        )
+        if not fp_speed_ok:
+            failures.append(
+                f"{p['name']}: speed byte {p['base91_s']!r} expected "
+                f"{spec_fp_kmh:.3f} km/h, direwolf got {got_fp_kmh} km/h "
+                f"(tolerance ±{_SPEED_TOL_KMH} km/h)"
+            )
 
         packet_alt = (
             "TEST>APRS:=/"

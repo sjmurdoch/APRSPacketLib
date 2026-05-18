@@ -20,6 +20,11 @@
     {"speed_kn_input": 50, "encoded": "T", "speed_kmh_decoded": 92},
     {"speed_kn_input": 99, "encoded": "]", "speed_kmh_decoded": 186}
   ],
+  "course_roundtrip_vectors": [
+    {"input_deg": 89, "encoded": "7", "decoded_deg": 88},
+    {"input_deg": 91, "encoded": "8", "decoded_deg": 92},
+    {"input_deg": 359, "encoded": "!", "decoded_deg": 0}
+  ],
   "fixed_points": [
     {"name": "Munich", "lat_deg": 48.138630, "lon_deg": 11.573410, "course_deg": 90, "speed_kn": 30, "altitude_m": 525, "altitude_ft": 1722, "base91_lat": "6/Y`", "base91_lon": "QG2.", "base91_c": "8", "base91_s": "N", "base91_alt_c": "I", "base91_alt_s": "z"},
     {"name": "CapeTown", "lat_deg": -33.918861, "lon_deg": 18.423300, "course_deg": 180, "speed_kn": 10, "altitude_m": 25, "altitude_ft": 82, "base91_lat": "_[9A", "base91_lon": "S.cy", "base91_c": "N", "base91_s": "@", "base91_alt_c": "9", "base91_alt_s": "6"},
